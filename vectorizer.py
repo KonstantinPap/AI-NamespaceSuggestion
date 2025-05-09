@@ -5,6 +5,7 @@ This module handles the vectorization of data using LanceDB and a local Ollama i
 """
 
 import lancedb
+import pyarrow as pa  # Add this import for schema types
 from typing import List, Dict
 import requests
 from tqdm import tqdm
@@ -17,7 +18,14 @@ LANCEDB_PATH = "./lancedb"  # Lokaler Pfad zur LanceDB-Datenbank
 OLLAMA_URL = "http://localhost:11434/api/embeddings"
 OLLAMA_MODEL = "mxbai-embed-large:latest"
 FILE_EXTENSION_FILTERS = [".al", ".json"]  # Erlaubte Dateiendungen
-ROOT_DIR = "C:/Repos/Github/Microsoft/StefanMaron/MSDyn365BC.Code.History/"  # Passe das Startverzeichnis ggf. an
+
+# Mehrere Root-Dirs als Liste
+ROOT_DIRS = [
+    r"C:/Repos/DevOps/HC-Work/Product_KBA/Product_KBA_BC_AL/app",
+    r"C:/Repos/DevOps/HC-Work/Product_MED/Product_MED_AL/app",
+    r"C:/Repos/DevOps/MTC-Work/Product_MED_Tech365/Product_MED_Tech/app",
+    r"C:/Repos/Github/Microsoft/StefanMaron/MSDyn365BC.Code.History"
+]
 
 # Initialize LanceDB
 def initialize_lancedb() -> lancedb.db.DBConnection:
@@ -39,42 +47,51 @@ def vectorize_data(data: List[Dict[str, str]]) -> None:
             Jeder Eintrag sollte zusätzlich 'filename' und 'directory' enthalten.
     """
     db = initialize_lancedb()
-    table = db.create_table(
-        "namespace_vectors",
-        schema={
-            "id": lancedb.ScalarType.STRING,
-            "content": lancedb.ScalarType.STRING,
-            "embedding": lancedb.VectorType.FLOAT32(1024),  # mxbai-embed-large: 1024-dim
-            "filename": lancedb.ScalarType.STRING,
-            "directory": lancedb.ScalarType.STRING,
-            "content_hash": lancedb.ScalarType.STRING,
-        },
-        overwrite=False  # Nicht überschreiben, sondern ergänzen/aktualisieren
-    )
+    
+    # Use pyarrow.Schema instead of dict
+    table_schema = pa.schema([
+        ("id", pa.string()),
+        ("content", pa.string()),
+        ("embedding", pa.list_(pa.float32(), 1024)),  # mxbai-embed-large: 1024-dim
+        ("filename", pa.string()),
+        ("directory", pa.string()),
+        ("content_hash", pa.string()),
+    ])
+    
+    try:
+        # Try to open existing table
+        table = db.open_table("namespace_vectors")
+    except:
+        # Create new table if it doesn't exist
+        table = db.create_table("namespace_vectors", schema=table_schema)
 
     start_time = time.time()
     with tqdm(total=len(data), desc="Vektorisieren", unit="Dokument") as pbar:
         for idx, item in enumerate(data, 1):
             content_hash = compute_content_hash(item["content"])
-            existing = table.search(
-                (table["filename"] == item.get("filename", "")) &
-                (table["content_hash"] == content_hash)
-            ).to_list()
-            if existing:
+            # Use pandas to filter for existence
+            df = table.to_pandas()
+            exists = (
+                (df["filename"] == item.get("filename", "")) &
+                (df["content_hash"] == content_hash)
+            ).any()
+            if exists:
                 pbar.update(1)
                 continue
 
-            table.delete(table["filename"] == item.get("filename", ""))
+            # Use filter string for delete
+            del_filter_str = f"filename = '{item.get('filename', '')}'"
+            table.delete(where=del_filter_str)
 
             embedding = generate_embedding(item["content"])
-            table.insert({
+            table.add([{
                 "id": item["id"],
                 "content": item["content"],
                 "embedding": embedding,
                 "filename": item.get("filename", ""),
                 "directory": item.get("directory", ""),
                 "content_hash": content_hash,
-            })
+            }])
 
             elapsed = time.time() - start_time
             avg_time = elapsed / idx
@@ -152,10 +169,15 @@ def collect_files(root_dir: str, extensions: list) -> List[Dict[str, str]]:
     return result
 
 def main():
-    print(f"Starte Vektorisierung ab: {ROOT_DIR} (nur {', '.join(FILE_EXTENSION_FILTERS)})")
-    data = collect_files(ROOT_DIR, FILE_EXTENSION_FILTERS)
-    print(f"{len(data)} Dateien gefunden. Starte Vektorisierung...")
-    vectorize_data(data)
+    all_data = []
+    print("Starte Vektorisierung für folgende Verzeichnisse:")
+    for root_dir in ROOT_DIRS:
+        print(f"  - {root_dir} (nur {', '.join(FILE_EXTENSION_FILTERS)})")
+        data = collect_files(root_dir, FILE_EXTENSION_FILTERS)
+        print(f"{len(data)} Dateien gefunden in {root_dir}.")
+        all_data.extend(data)
+    print(f"Insgesamt {len(all_data)} Dateien gefunden. Starte Vektorisierung...")
+    vectorize_data(all_data)
     print("Vektorisierung abgeschlossen.")
 
 if __name__ == "__main__":
