@@ -1,0 +1,4 @@
+lancedb
+requests
+tqdm
+pandas
