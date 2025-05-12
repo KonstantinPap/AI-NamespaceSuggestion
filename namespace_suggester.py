@@ -9,8 +9,8 @@ from tqdm import tqdm
 import lancedb
 import numpy as np
 
-HC_ROOT = "/home/kosta/Repos/DevOps/Product_MED/Product_MED_AL/app/"    # Passe ggf. an
-MTC_ROOT = "/home/kosta/Repos/DevOps/Product_MED_Tech365/Product_MED_Tech/app/"  # Passe ggf. an
+HC_ROOT = "C:\\Repos\\DevOps\\HC-Work\\Product_MED\\Product_MED_AL\\app\\"
+MTC_ROOT = "C:\\Repos\\DevOps\\MTC-Work\\Product_MED_Tech365\\Product_MED_Tech\\app\\"
 CSV_OUTPUT = "namespace_suggestions.csv"
 
 OBJECT_PATTERN = re.compile(r'^(table|page|codeunit|report|xmlport|query|enum|interface|controladdin|pageextension|tableextension|enumextension|profile|dotnet|entitlement|permissionset|permissionsetextension|reportextension|enumvalue|entitlementset|entitlementsetextension)\s+(\d+)?\s*"?([\w\d_]+)"?', re.IGNORECASE)
