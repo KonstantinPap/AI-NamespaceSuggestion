@@ -588,6 +588,27 @@ def read_existing_csv(csv_path: str) -> set:
     return done
 
 import time
+import openpyxl
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
+
+def write_results_to_excel(rows, fieldnames, excel_path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Namespace Vorschläge"
+    ws.append(fieldnames)
+    for row in rows:
+        ws.append([row.get(col, "") for col in fieldnames])
+    # Formatierung: Zeilenumbruch für lange Textspalten
+    wrap_cols = ["Namespace Begründung", "Alternative Namespace Begründung", "Analyse"]
+    for idx, col in enumerate(fieldnames, 1):
+        if col in wrap_cols:
+            for cell in ws[get_column_letter(idx)]:
+                cell.alignment = Alignment(wrap_text=True)
+    # Optional: Spaltenbreite anpassen
+    for idx, col in enumerate(fieldnames, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = max(20, len(col) + 2)
+    wb.save(excel_path)
 
 def main():
     # Index für Referenz-Kontext (alle Roots)
@@ -613,6 +634,8 @@ def main():
     processed_tokens = 0
     start_time = time.time()
     avg_tokens_per_obj = 2000
+
+    results = []
 
     write_header = not os.path.exists(CSV_OUTPUT) or os.stat(CSV_OUTPUT).st_size == 0
     with open(CSV_OUTPUT, "a", newline="", encoding="utf-8") as csvfile:
@@ -641,7 +664,7 @@ def main():
             ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos)
             alt_ns = "; ".join([a[0] for a in alternatives])
             alt_reason = "; ".join([a[1] for a in alternatives])
-            writer.writerow({
+            row = {
                 "ObjectType": otype,
                 "HC ObjectName": hc_name,
                 "MTC ObjectName": mtc_name,
@@ -651,8 +674,10 @@ def main():
                 "Alternative Namespace Begründung": alt_reason,
                 "Dateipfad": (hc_obj["filepath"] if hc_obj else "") or (mtc_obj["filepath"] if mtc_obj else ""),
                 "Analyse": analyse.strip().replace(chr(10), ' ')
-            })
+            }
+            writer.writerow(row)
             csvfile.flush()
+            results.append(row)
             processed_tokens += avg_tokens_per_obj
             elapsed = time.time() - start_time
             avg_time = elapsed / idx if idx > 0 else 0
@@ -662,6 +687,10 @@ def main():
             eta = max((remaining * avg_time), (expected_time_for_tokens - elapsed))
             print(f"Bearbeitet: {idx}/{total} | Verstrichen: {elapsed:.1f}s | Ø {avg_time:.1f}s/Objekt | ETA: {eta/60:.1f}min", end="\r")
             time.sleep(0.2)
+
+    # Nach Abschluss: Export nach Excel
+    excel_path = CSV_OUTPUT.replace(".csv", ".xlsx")
+    write_results_to_excel(results, fieldnames, excel_path)
 
 if __name__ == "__main__":
     main()
