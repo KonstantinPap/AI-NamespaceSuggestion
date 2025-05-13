@@ -8,9 +8,9 @@ import numpy as np
 import hashlib
 
 # -------------------- KONSTANTEN --------------------
-OBJECT_NAME_TO_REVIEW = "KVSMEDApplicationAreaMgt"  # <--- Setze hier den gewünschten Objektnamen
-HC_ROOT = "/home/kosta/Repos/DevOps/Product_MED/Product_MED_AL/app/"
-MTC_ROOT = "/home/kosta/Repos/DevOps/Product_MED_Tech365/Product_MED_Tech/app/"
+OBJECT_NAME_TO_REVIEW = "KVSMEDCLLCMBGeneralMgtSub"  # <--- Setze hier den gewünschten Objektnamen
+HC_ROOT = "C:/Repos/DevOps/HC-Work/Product_MED\Product_MED_AL/app/"
+MTC_ROOT = "C:/Repos/DevOps/MTC-Work/Product_MED_Tech365/Product_MED_Tech/app/"
 
 CSV_PATH = "namespace_suggestions.csv"
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -324,6 +324,109 @@ def get_csv_hash(csv_path, object_name):
                 return row.get("Hash", "")
     return ""
 
+def extract_explicit_namespace_from_file(filepath):
+    """Versucht, einen expliziten Namespace aus der Datei zu extrahieren (z.B. als Attribut oder Kommentar)."""
+    import re
+    NAMESPACE_PATTERN = re.compile(r'Namespace\s*=\s*"([\w\d_]+)"', re.IGNORECASE)
+    with open(filepath, encoding="utf-8") as f:
+        for line in f:
+            match = NAMESPACE_PATTERN.search(line)
+            if match:
+                return match.group(1)
+    return None
+
+def extract_extension_base_object(filepath):
+    """Extrahiert bei Extension-Objekten die Basisklasse (z.B. extends "Customer List")."""
+    import re
+    EXTENSION_PATTERN = re.compile(r'(pageextension|tableextension|enumextension|reportextension)\s+\d*\s*"?([\w\d_]+)"?\s+extends\s+"?([\w\d_ ]+)"?', re.IGNORECASE)
+    with open(filepath, encoding="utf-8") as f:
+        for line in f:
+            match = EXTENSION_PATTERN.match(line.strip())
+            if match:
+                return match.group(1), match.group(3)
+    return None, None
+
+def get_namespace_from_base_object(base_object_name, lancedb_path=LANCEDB_PATH, lancedb_table=LANCEDB_TABLE):
+    """Sucht den Namespace der Basisklasse via RAG (LanceDB)."""
+    db = lancedb.connect(lancedb_path)
+    table = db.open_table(lancedb_table)
+    # Dummy-Embedding für Suche, in Produktion: echtes Embedding
+    query_emb = np.zeros(1024, dtype=np.float32).tolist()
+    try:
+        results = table.search(query_emb).limit(10).to_list()
+        # Suche nach exaktem Namen
+        for obj in results:
+            if obj.get("object_name", "").strip().lower() == base_object_name.strip().lower():
+                return obj.get("namespace", None)
+    except Exception:
+        pass
+    return None
+
+def build_objectname_to_path_map(roots):
+    """Erstellt ein Dictionary: object_name_lower -> filepath für alle .al-Dateien in den angegebenen Roots."""
+    import re
+    OBJECT_PATTERN = re.compile(r'^(table|page|codeunit|report|xmlport|query|enum|interface|controladdin|pageextension|tableextension|enumextension|profile|dotnet|entitlement|permissionset|permissionsetextension|reportextension|enumvalue|entitlementset|entitlementsetextension)\s+(\d+)?\s*"?([\w\d_]+)"?', re.IGNORECASE)
+    name_to_path = {}
+    total_files = 0
+    parsed_files = 0
+    
+    print(f"Starte Indexierung der AL-Dateien in: {roots}")
+    
+    for root in roots:
+        if not os.path.exists(root):
+            print(f"WARNUNG: Pfad existiert nicht: {root}")
+            continue
+            
+        print(f"Durchsuche Verzeichnis: {root}")
+        for dirpath, _, filenames in os.walk(root):
+            al_files = [f for f in filenames if f.lower().endswith(".al")]
+            total_files += len(al_files)
+            
+            for f in al_files:
+                filepath = os.path.join(dirpath, f)
+                try:
+                    with open(filepath, encoding="utf-8") as file:
+                        # Suche nach der ersten Zeile mit Objektdefinition
+                        content = file.read()
+                        
+                        # Suche nach dem Objektnamen in der Datei
+                        for line in content.split('\n'):
+                            line = line.strip()
+                            if not line or line.startswith("//"):
+                                continue
+                            match = OBJECT_PATTERN.match(line)
+                            if match:
+                                obj_type = match.group(1)
+                                obj_name = match.group(3)
+                                
+                                if obj_name:
+                                    parsed_files += 1
+                                    obj_name_lower = obj_name.lower()
+                                    name_to_path[obj_name_lower] = filepath
+                                    # Debug: Objekt gefunden
+                                    # print(f"Objekt gefunden: {obj_name} in {filepath}")
+                                break
+                except Exception as e:
+                    print(f"Fehler beim Lesen von {filepath}: {e}")
+                    continue
+    
+    print(f"Indexierung abgeschlossen: {parsed_files} Objekte in {total_files} AL-Dateien gefunden.")
+    return name_to_path
+
+def find_al_file_by_partial_name(object_name, roots):
+    """Fallback-Methode: Suche nach Dateinamen, die den Objektnamen enthalten."""
+    print(f"Fallback-Suche für '{object_name}' nach Dateinamen...")
+    for root in roots:
+        if not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for f in filenames:
+                if f.lower().endswith(".al") and object_name.lower() in f.lower():
+                    filepath = os.path.join(dirpath, f)
+                    print(f"Datei gefunden (Fallback): {filepath}")
+                    return filepath
+    return None
+
 def main():
     if len(sys.argv) >= 2:
         object_name = sys.argv[1]
@@ -332,25 +435,146 @@ def main():
         print(f"Kein Objektname als Argument übergeben, verwende Konstante: '{OBJECT_NAME_TO_REVIEW}'")
 
     # Prüfe, ob Objekt bereits in CSV existiert
-    if exists_in_csv(CSV_PATH, object_name):
-        print(f"Objekt '{object_name}' ist bereits in der CSV. Ausgabe der bisherigen Analyse:")
+    already_in_csv = exists_in_csv(CSV_PATH, object_name)
+    previous_row = None
+    if already_in_csv:
         rows = load_csv_data(CSV_PATH)
         object_rows = find_object_rows(rows, object_name)
-        for row in object_rows:
-            print_namespace_result(row)
-        return
+        if object_rows:
+            previous_row = object_rows[0]  # Nur das erste Ergebnis für Vergleich
 
-    # Objekt ist NEU: Suche Datei in HC und MTC
-    filepath = find_al_file(object_name, HC_ROOT) or find_al_file(object_name, MTC_ROOT)
+    # Baue ein Dictionary object_name_lower -> filepath
+    objectname_to_path = build_objectname_to_path_map([HC_ROOT, MTC_ROOT])
+    
+    # Debug: Zeige alle gefundenen Objekte an (optional, für große Repositories auskommentieren)
+    # print("\nGefundene Objekte:")
+    # for name, path in objectname_to_path.items():
+    #     print(f"  - {name}: {path}")
+    
+    print(f"\nSuche nach Objekt: '{object_name}' (Lowercase: '{object_name.lower()}')")
+    
+    # Suche nach Objektname im Dictionary (Case-insensitive)
+    filepath = objectname_to_path.get(object_name.lower())
+    
+    # Fallback: Wenn keine Datei gefunden, versuche direkte Dateinamensuche
     if not filepath:
-        print(f"Keine .al-Datei für Objekt '{object_name}' gefunden.")
+        print(f"Objekt '{object_name}' nicht im Index gefunden. Versuche Fallback-Suche...")
+        filepath = find_al_file_by_partial_name(object_name, [HC_ROOT, MTC_ROOT])
+        
+    if not filepath:
+        print(f"FEHLER: Keine .al-Datei für Objekt '{object_name}' gefunden.")
+        print(f"Verfügbare Pfade überprüfen: HC_ROOT={HC_ROOT}, MTC_ROOT={MTC_ROOT}")
+        print("Diese Pfade müssen auf Ihrer Maschine existieren und gültige AL-Dateien enthalten.")
         sys.exit(1)
+        
+    print(f"Datei gefunden: {filepath}")
+    
     directory = os.path.dirname(filepath)
     filename = os.path.basename(filepath)
     object_type, obj_name = extract_object_info_from_file(filepath)
     if not object_type or not obj_name:
         print(f"Konnte Objektinformationen aus Datei '{filepath}' nicht extrahieren.")
         sys.exit(1)
+
+    # --- Schritt 1: Expliziten Namespace erkennen ---
+    explicit_ns = extract_explicit_namespace_from_file(filepath)
+    if explicit_ns:
+        print(f"Expliziter Namespace in Datei gefunden: {explicit_ns}")
+        ns = explicit_ns
+        ns_reason = "Namespace wurde explizit im AL-Code angegeben."
+        alt_ns = ""
+        alt_reason = ""
+        answer = f'{{"namespace": "{ns}", "reason": "{ns_reason}", "alternatives": []}}'
+        # In Vektor-DB aufnehmen
+        add_to_lancedb(
+            object_id=f"{object_type}|{obj_name}",
+            object_type=object_type,
+            object_name=obj_name,
+            namespace=ns,
+            filename=filename,
+            directory=directory
+        )
+        # In CSV aufnehmen
+        current_hash = file_hash(filepath)
+        fieldnames = [
+            "ObjectType",
+            "ObjectName HC",
+            "ObjectName MTC",
+            "Namespace Vorschlag",
+            "Namespace Begründung",
+            "Alternative Namespace Vorschlag",
+            "Alternative Namespace Begründung",
+            "Dateiname",
+            "Analyse",
+            "Hash"
+        ]
+        row = {
+            "ObjectType": object_type,
+            "ObjectName HC": obj_name,
+            "ObjectName MTC": "",
+            "Namespace Vorschlag": ns,
+            "Namespace Begründung": ns_reason,
+            "Alternative Namespace Vorschlag": alt_ns,
+            "Alternative Namespace Begründung": alt_reason,
+            "Dateiname": filename,
+            "Analyse": answer,
+            "Hash": current_hash
+        }
+        print_namespace_result(row, previous_row)
+        if not already_in_csv:
+            append_to_csv(CSV_PATH, row, fieldnames)
+        return
+
+    # --- Schritt 2: Extension-Typ? Dann Basisklasse analysieren ---
+    ext_type, base_object = extract_extension_base_object(filepath)
+    if ext_type and base_object:
+        base_ns = get_namespace_from_base_object(base_object)
+        if base_ns:
+            print(f"Namespace der Basisklasse '{base_object}' gefunden: {base_ns}")
+            ns = base_ns
+            ns_reason = f"Namespace wurde von der Basisklasse '{base_object}' übernommen."
+            alt_ns = ""
+            alt_reason = ""
+            answer = f'{{"namespace": "{ns}", "reason": "{ns_reason}", "alternatives": []}}'
+            # In Vektor-DB aufnehmen
+            add_to_lancedb(
+                object_id=f"{object_type}|{obj_name}",
+                object_type=object_type,
+                object_name=obj_name,
+                namespace=ns,
+                filename=filename,
+                directory=directory
+            )
+            # In CSV aufnehmen
+            current_hash = file_hash(filepath)
+            fieldnames = [
+                "ObjectType",
+                "ObjectName HC",
+                "ObjectName MTC",
+                "Namespace Vorschlag",
+                "Namespace Begründung",
+                "Alternative Namespace Vorschlag",
+                "Alternative Namespace Begründung",
+                "Dateiname",
+                "Analyse",
+                "Hash"
+            ]
+            row = {
+                "ObjectType": object_type,
+                "ObjectName HC": obj_name,
+                "ObjectName MTC": "",
+                "Namespace Vorschlag": ns,
+                "Namespace Begründung": ns_reason,
+                "Alternative Namespace Vorschlag": alt_ns,
+                "Alternative Namespace Begründung": alt_reason,
+                "Dateiname": filename,
+                "Analyse": answer,
+                "Hash": current_hash
+            }
+            print_namespace_result(row, previous_row)
+            if not already_in_csv:
+                append_to_csv(CSV_PATH, row, fieldnames)
+            return
 
     # --- RAG: Kontextobjekte aus LanceDB holen ---
     context_objects = retrieve_context(object_type, obj_name, top_k=3)
@@ -442,8 +666,9 @@ def main():
         "Analyse": answer,
         "Hash": current_hash
     }
-    append_to_csv(CSV_PATH, row, fieldnames)
-    print_namespace_result(row)
+    print_namespace_result(row, previous_row)
+    if not already_in_csv:
+        append_to_csv(CSV_PATH, row, fieldnames)
 
 if __name__ == "__main__":
     main()
