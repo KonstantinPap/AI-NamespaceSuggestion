@@ -1,40 +1,388 @@
 import os
 import re
 import csv
-import requests
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-import lancedb
-import numpy as np
+from langchain_community.chat_models import AzureChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
 
-HC_ROOT = "C:\\Repos\\DevOps\\HC-Work\\Product_MED\\Product_MED_AL\\app\\"
-MTC_ROOT = "C:\\Repos\\DevOps\\MTC-Work\\Product_MED_Tech365\\Product_MED_Tech\\app\\"
+HC_ROOT = "C:/Repos/DevOps/HC-Work/Product_MED/Product_MED_AL/app/"
+MTC_ROOT = "C:/Repos/DevOps/MTC-Work/Product_MED_Tech365/Product_MED_Tech/app/"
+ANALYZE_ROOTS = [HC_ROOT, MTC_ROOT]
+
+SEARCH_ROOTS = [
+    HC_ROOT,
+    MTC_ROOT,
+    "C:/Repos/Github/StefanMaron/MSDyn365BC.Code.History/BaseApp/Source/Base Application/",
+    "C:/Repos/DevOps/HC-Work/Product_KBA/Product_KBA_BC_AL/app/",
+]
 CSV_OUTPUT = "namespace_suggestions.csv"
+# Azure OpenAI Konfiguration
+OPENAI_API_KEY = os.environ.get("AZURE_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
+OPENAI_API_BASE = os.environ.get("AZURE_OPENAI_ENDPOINT")
+OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
 
 OBJECT_PATTERN = re.compile(r'^(table|page|codeunit|report|xmlport|query|enum|interface|controladdin|pageextension|tableextension|enumextension|profile|dotnet|entitlement|permissionset|permissionsetextension|reportextension|enumvalue|entitlementset|entitlementsetextension)\s+(\d+)?\s*"?([\w\d_]+)"?', re.IGNORECASE)
+NAMESPACE_PATTERN = re.compile(r'(?:Namespace\s*=\s*"([\w\d_.]+)"|namespace\s+([\w\d_.]+)\s*;)', re.IGNORECASE)
+REF_PATTERN = re.compile(
+    r'(?:'
+        r'(Database|Table|Page|Codeunit|Report|XmlPort|Query|Enum)\s*::\s*"?([\w\d_]+)"?'
+        r'|'
+        r':\s*(Record|Page|Codeunit|Report|XmlPort|Query|Enum)\s+("?[\w\d_]+"?)'
+    r')',
+    re.IGNORECASE
+)
 
-PREFIX_HC = "KVSMED"
-PREFIX_MTC = "KVSMTC"
+# Namespace-Beschreibungen wie in namespace_review.py
+allowed_namespaces_with_desc = [
+        ("Microsoft", "Microsoft Standardfunktionalität und Basiskomponenten"),
+        ("Microsoft.API", "Microsoft API-spezifische Komponenten und Schnittstellen"),
+        ("Microsoft.API.Upgrade", "Upgrade-bezogene APIs und Migrationshilfen"),
+        ("Microsoft.API.Webhooks", "Webhooks-Integration und Ereignisbenachrichtigungen"),
+        ("Microsoft.AccountantPortal", "Funktionen für das Accountant Portal"),
+        ("Microsoft.Assembly.Comment", "Kommentare und Anmerkungen im Bereich Montage"),
+        ("Microsoft.Assembly.Costing", "Kalkulation und Kostenrechnung für Montage"),
+        ("Microsoft.Assembly.Document", "Dokumentenmanagement im Montagebereich"),
+        ("Microsoft.Assembly.History", "Historie und Protokollierung von Montageprozessen"),
+        ("Microsoft.Assembly.Posting", "Buchungen und Verbuchungen im Montagebereich"),
+        ("Microsoft.Assembly.Reports", "Berichte und Auswertungen zur Montage"),
+        ("Microsoft.Assembly.Setup", "Einrichtung und Konfiguration der Montage"),
+        ("Microsoft.Bank.BankAccount", "Bankkontenverwaltung"),
+        ("Microsoft.Bank.Check", "Scheckverwaltung und -verarbeitung"),
+        ("Microsoft.Bank.Deposit", "Einzahlungen und Bankeinlagen"),
+        ("Microsoft.Bank.DirectDebit", "Lastschriftverfahren und SEPA-Lastschriften"),
+        ("Microsoft.Bank.Ledger", "Bankbuchhaltung und Konten"),
+        ("Microsoft.Bank.Payment", "Zahlungsabwicklung und Zahlungsverkehr"),
+        ("Microsoft.Bank.PositivePay", "Positive Pay-Funktionen für Banken"),
+        ("Microsoft.Bank.Reconciliation", "Bankabstimmung und Kontenabgleich"),
+        ("Microsoft.Bank.Reports", "Bankbezogene Berichte und Auswertungen"),
+        ("Microsoft.Bank.Setup", "Einrichtung und Konfiguration von Bankfunktionen"),
+        ("Microsoft.Bank.Statement", "Bankauszüge und Kontoauszugsverarbeitung"),
+        ("Microsoft.Booking", "Buchungsfunktionen und Reservierungen"),
+        ("Microsoft.CRM.Analysis", "CRM-Analysen und Auswertungen"),
+        ("Microsoft.CRM.BusinessRelation", "Geschäftsbeziehungen im CRM"),
+        ("Microsoft.CRM.Campaign", "Kampagnenmanagement im CRM"),
+        ("Microsoft.CRM.Comment", "Kommentare und Notizen im CRM"),
+        ("Microsoft.CRM.Contact", "Kontaktverwaltung im CRM"),
+        ("Microsoft.CRM.Duplicates", "Duplikaterkennung und -management im CRM"),
+        ("Microsoft.CRM.Interaction", "Interaktionen und Aktivitäten im CRM"),
+        ("Microsoft.CRM.Opportunity", "Vertriebschancen und Opportunities im CRM"),
+        ("Microsoft.CRM.Outlook", "Outlook-Integration für CRM"),
+        ("Microsoft.CRM.Profiling", "Profiling und Segmentierung im CRM"),
+        ("Microsoft.CRM.Reports", "CRM-Berichte und Auswertungen"),
+        ("Microsoft.CRM.RoleCenters", "Rollencenter für CRM-Anwender"),
+        ("Microsoft.CRM.Segment", "Segmentierung und Zielgruppen im CRM"),
+        ("Microsoft.CRM.Setup", "Einrichtung und Konfiguration des CRM"),
+        ("Microsoft.CRM.Task", "Aufgabenmanagement im CRM"),
+        ("Microsoft.CRM.Team", "Teamverwaltung im CRM"),
+        ("Microsoft.CashFlow.Account", "Liquiditätskonten für Cashflow-Planung"),
+        ("Microsoft.CashFlow.Comment", "Kommentare im Bereich Cashflow"),
+        ("Microsoft.CashFlow.Forecast", "Cashflow-Prognosen und -Planung"),
+        ("Microsoft.CashFlow.Reports", "Berichte zur Liquiditätsplanung"),
+        ("Microsoft.CashFlow.Setup", "Einrichtung der Cashflow-Funktionen"),
+        ("Microsoft.CashFlow.Worksheet", "Arbeitsblätter für Cashflow-Analysen"),
+        ("Microsoft.CostAccounting.Account", "Kostenrechnungskonten"),
+        ("Microsoft.CostAccounting.Allocation", "Kostenverteilung und Umlagen"),
+        ("Microsoft.CostAccounting.Budget", "Kostenrechnungsbudgets"),
+        ("Microsoft.CostAccounting.Journal", "Kostenrechnungsjournale"),
+        ("Microsoft.CostAccounting.Ledger", "Kostenrechnungshauptbuch"),
+        ("Microsoft.CostAccounting.Posting", "Buchungen in der Kostenrechnung"),
+        ("Microsoft.CostAccounting.Reports", "Berichte zur Kostenrechnung"),
+        ("Microsoft.CostAccounting.Setup", "Einrichtung der Kostenrechnung"),
+        ("Microsoft.EServices.EDocument", "Elektronische Dokumente und eServices"),
+        ("Microsoft.Finance.AllocationAccount", "Verteilungskonten im Finanzwesen"),
+        ("Microsoft.Finance.AllocationAccount.Purchase", "Verteilungskonten für Einkauf"),
+        ("Microsoft.Finance.AllocationAccount.Sales", "Verteilungskonten für Verkauf"),
+        ("Microsoft.Finance.Analysis", "Finanzanalysen und Auswertungen"),
+        ("Microsoft.Finance.AuditFileExport", "Export von Audit-Dateien"),
+        ("Microsoft.Finance.Consolidation", "Konsolidierung im Finanzbereich"),
+        ("Microsoft.Finance.Currency", "Währungsmanagement"),
+        ("Microsoft.Finance.Deferral", "Abgrenzungen und Rechnungsabgrenzungsposten"),
+        ("Microsoft.Finance.Dimension", "Dimensionen im Finanzwesen"),
+        ("Microsoft.Finance.Dimension.Correction", "Korrekturen von Dimensionen"),
+        ("Microsoft.Finance.FinancialReports", "Finanzberichte und Auswertungen"),
+        ("Microsoft.Finance.GeneralLedger.Account", "Sachkonten im Hauptbuch"),
+        ("Microsoft.Finance.GeneralLedger.Budget", "Budgets im Hauptbuch"),
+        ("Microsoft.Finance.GeneralLedger.Journal", "Journale im Hauptbuch"),
+        ("Microsoft.Finance.GeneralLedger.Ledger", "Hauptbuchfunktionen"),
+        ("Microsoft.Finance.GeneralLedger.Posting", "Buchungen im Hauptbuch"),
+        ("Microsoft.Finance.GeneralLedger.Preview", "Vorschau von Hauptbuchbuchungen"),
+        ("Microsoft.Finance.GeneralLedger.Reports", "Berichte zum Hauptbuch"),
+        ("Microsoft.Finance.GeneralLedger.Reversal", "Stornierungen im Hauptbuch"),
+        ("Microsoft.Finance.GeneralLedger.Setup", "Einrichtung des Hauptbuchs"),
+        ("Microsoft.Finance.Payroll", "Lohn- und Gehaltsabrechnung"),
+        ("Microsoft.Finance.ReceivablesPayables", "Debitoren- und Kreditorenbuchhaltung"),
+        ("Microsoft.Finance.RoleCenters", "Rollencenter für Finanzanwender"),
+        ("Microsoft.Finance.SalesTax", "Umsatzsteuerverwaltung"),
+        ("Microsoft.Finance.VAT", "Mehrwertsteuerverwaltung"),
+        ("Microsoft.Finance.VAT.Calculation", "Berechnung der Mehrwertsteuer"),
+        ("Microsoft.Finance.VAT.Clause", "Mehrwertsteuerklauseln"),
+        ("Microsoft.Finance.VAT.Ledger", "Mehrwertsteuerhauptbuch"),
+        ("Microsoft.Finance.VAT.RateChange", "Mehrwertsteuersatzänderungen"),
+        ("Microsoft.Finance.VAT.Registration", "Mehrwertsteuerregistrierung"),
+        ("Microsoft.Finance.VAT.Reporting", "Mehrwertsteuerberichte"),
+        ("Microsoft.Finance.VAT.Setup", "Einrichtung der Mehrwertsteuer"),
+        ("Microsoft.FixedAssets.Depreciation", "Abschreibungen auf Anlagegüter"),
+        ("Microsoft.FixedAssets.FixedAsset", "Verwaltung von Anlagegütern"),
+        ("Microsoft.FixedAssets.Insurance", "Versicherung von Anlagegütern"),
+        ("Microsoft.FixedAssets.Journal", "Anlagenjournale"),
+        ("Microsoft.FixedAssets.Ledger", "Anlagenhauptbuch"),
+        ("Microsoft.FixedAssets.Maintenance", "Wartung von Anlagegütern"),
+        ("Microsoft.FixedAssets.Posting", "Buchungen im Anlagenbereich"),
+        ("Microsoft.FixedAssets.Reports", "Berichte zu Anlagegütern"),
+        ("Microsoft.FixedAssets.Setup", "Einrichtung der Anlagenbuchhaltung"),
+        ("Microsoft.Foundation.Address", "Adressverwaltung"),
+        ("Microsoft.Foundation.Attachment", "Anhänge und Dokumentenmanagement"),
+        ("Microsoft.Foundation.AuditCodes", "Audit-Codes und Prüfungsfunktionen"),
+        ("Microsoft.Foundation.BatchProcessing", "Stapelverarbeitung und Hintergrundprozesse"),
+        ("Microsoft.Foundation.Calendar", "Kalenderfunktionen"),
+        ("Microsoft.Foundation.Comment", "Kommentare und Notizen"),
+        ("Microsoft.Foundation.Company", "Unternehmensverwaltung"),
+        ("Microsoft.Foundation.Enums", "Aufzählungstypen und Enums"),
+        ("Microsoft.Foundation.ExtendedText", "Erweiterte Textfunktionen"),
+        ("Microsoft.Foundation.Navigate", "Navigationsfunktionen"),
+        ("Microsoft.Foundation.NoSeries", "Nummernserienverwaltung"),
+        ("Microsoft.Foundation.PaymentTerms", "Zahlungsbedingungen"),
+        ("Microsoft.Foundation.Period", "Periodenverwaltung"),
+        ("Microsoft.Foundation.Reporting", "Berichtswesen und Reporting"),
+        ("Microsoft.Foundation.Shipping", "Versand und Logistik"),
+        ("Microsoft.Foundation.Task", "Aufgabenverwaltung"),
+        ("Microsoft.Foundation.UOM", "Mengeneinheitenverwaltung"),
+        ("Microsoft.HumanResources.Absence", "Abwesenheitsverwaltung"),
+        ("Microsoft.HumanResources.Analysis", "Analysen im Personalbereich"),
+        ("Microsoft.HumanResources.Comment", "Kommentare im Personalbereich"),
+        ("Microsoft.HumanResources.Employee", "Mitarbeiterverwaltung"),
+        ("Microsoft.HumanResources.Payables", "Verbindlichkeiten im Personalbereich"),
+        ("Microsoft.HumanResources.Reports", "Berichte im Personalbereich"),
+        ("Microsoft.HumanResources.RoleCenters", "Rollencenter für Personalwesen"),
+        ("Microsoft.HumanResources.Setup", "Einrichtung des Personalbereichs"),
+        ("Microsoft.Integration.D365Sales", "Integration mit Dynamics 365 Sales"),
+        ("Microsoft.Integration.Dataverse", "Integration mit Dataverse"),
+        ("Microsoft.Integration.Entity", "Integration von Entitäten"),
+        ("Microsoft.Integration.FieldService", "Integration mit Field Service"),
+        ("Microsoft.Integration.Graph", "Microsoft Graph-Integration"),
+        ("Microsoft.Integration.PowerBI", "Power BI-Integration"),
+        ("Microsoft.Integration.SyncEngine", "Synchronisationsengine"),
+        ("Microsoft.Intercompany", "Intercompany-Funktionen"),
+        ("Microsoft.Intercompany.BankAccount", "Intercompany-Bankkonten"),
+        ("Microsoft.Intercompany.Comment", "Kommentare im Intercompany-Bereich"),
+        ("Microsoft.Intercompany.DataExchange", "Datenaustausch zwischen Unternehmen"),
+        ("Microsoft.Intercompany.Dimension", "Dimensionen im Intercompany-Bereich"),
+        ("Microsoft.Intercompany.GLAccount", "Sachkonten im Intercompany-Bereich"),
+        ("Microsoft.Intercompany.Inbox", "Eingangskorb für Intercompany"),
+        ("Microsoft.Intercompany.Journal", "Intercompany-Journale"),
+        ("Microsoft.Intercompany.Outbox", "Ausgangskorb für Intercompany"),
+        ("Microsoft.Intercompany.Partner", "Intercompany-Partner"),
+        ("Microsoft.Intercompany.Reports", "Berichte im Intercompany-Bereich"),
+        ("Microsoft.Intercompany.Setup", "Einrichtung des Intercompany-Bereichs"),
+        ("Microsoft.Inventory", "Bestandsverwaltung"),
+        ("Microsoft.Inventory.Analysis", "Bestandsanalysen"),
+        ("Microsoft.Inventory.Availability", "Bestandsverfügbarkeit"),
+        ("Microsoft.Inventory.BOM", "Stücklistenverwaltung"),
+        ("Microsoft.Inventory.BOM.Tree", "Stücklistenstruktur"),
+        ("Microsoft.Inventory.Comment", "Kommentare im Bestandsbereich"),
+        ("Microsoft.Inventory.Costing", "Kostenrechnung im Bestandsbereich"),
+        ("Microsoft.Inventory.Costing.ActionMessage", "Handlungsempfehlungen zur Kostenrechnung"),
+        ("Microsoft.Inventory.Counting", "Inventurzählung"),
+        ("Microsoft.Inventory.Counting.Comment", "Kommentare zur Inventurzählung"),
+        ("Microsoft.Inventory.Counting.Document", "Dokumente zur Inventurzählung"),
+        ("Microsoft.Inventory.Counting.History", "Historie der Inventurzählung"),
+        ("Microsoft.Inventory.Counting.Journal", "Inventurzählungsjournale"),
+        ("Microsoft.Inventory.Counting.Recording", "Erfassung der Inventurzählung"),
+        ("Microsoft.Inventory.Counting.Reports", "Berichte zur Inventurzählung"),
+        ("Microsoft.Inventory.Counting.Tracking", "Nachverfolgung der Inventurzählung"),
+        ("Microsoft.Inventory.Document", "Bestandsdokumente"),
+        ("Microsoft.Inventory.History", "Bestandshistorie"),
+        ("Microsoft.Inventory.Intrastat", "Intrastat-Meldungen"),
+        ("Microsoft.Inventory.Item", "Artikelverwaltung"),
+        ("Microsoft.Inventory.Item.Attribute", "Artikelattribute"),
+        ("Microsoft.Inventory.Item.Catalog", "Artikelkatalog"),
+        ("Microsoft.Inventory.Item.Picture", "Artikelbilder"),
+        ("Microsoft.Inventory.Item.Substitution", "Artikelersatz"),
+        ("Microsoft.Inventory.Journal", "Bestandsjournale"),
+        ("Microsoft.Inventory.Ledger", "Bestandshauptbuch"),
+        ("Microsoft.Inventory.Location", "Lagerorte"),
+        ("Microsoft.Inventory.MarketingText", "Marketingtexte für Artikel"),
+        ("Microsoft.Inventory.Planning", "Bestandsplanung"),
+        ("Microsoft.Inventory.Posting", "Buchungen im Bestandsbereich"),
+        ("Microsoft.Inventory.Reconciliation", "Bestandsabstimmung"),
+        ("Microsoft.Inventory.Reports", "Berichte zur Bestandsverwaltung"),
+        ("Microsoft.Inventory.Requisition", "Bestellanforderungen"),
+        ("Microsoft.Inventory.RoleCenters", "Rollencenter für Bestandsverwaltung"),
+        ("Microsoft.Inventory.Setup", "Einrichtung der Bestandsverwaltung"),
+        ("Microsoft.Inventory.StandardCost", "Standardkosten im Bestand"),
+        ("Microsoft.Inventory.Tracking", "Bestandsnachverfolgung"),
+        ("Microsoft.Inventory.Transfer", "Bestandsübertragungen"),
+        ("Microsoft.Iventory.Item", "Artikelverwaltung (Tippfehler: Inventory)"),
+        ("Microsoft.Manufacturing.Capacity", "Kapazitätsplanung in der Fertigung"),
+        ("Microsoft.Manufacturing.Comment", "Kommentare im Fertigungsbereich"),
+        ("Microsoft.Manufacturing.Document", "Fertigungsdokumente"),
+        ("Microsoft.Manufacturing.Family", "Fertigungsfamilien"),
+        ("Microsoft.Manufacturing.Forecast", "Fertigungsprognosen"),
+        ("Microsoft.Manufacturing.Integration", "Integrationen im Fertigungsbereich"),
+        ("Microsoft.Manufacturing.Journal", "Fertigungsjournale"),
+        ("Microsoft.Manufacturing.MachineCenter", "Maschinenzentren in der Fertigung"),
+        ("Microsoft.Manufacturing.Planning", "Fertigungsplanung"),
+        ("Microsoft.Manufacturing.ProductionBOM", "Produktionsstücklisten"),
+        ("Microsoft.Manufacturing.Reports", "Berichte zur Fertigung"),
+        ("Microsoft.Manufacturing.RoleCenters", "Rollencenter für Fertigung"),
+        ("Microsoft.Manufacturing.Routing", "Arbeitspläne in der Fertigung"),
+        ("Microsoft.Manufacturing.Setup", "Einrichtung der Fertigung"),
+        ("Microsoft.Manufacturing.StandardCost", "Standardkosten in der Fertigung"),
+        ("Microsoft.Manufacturing.WorkCenter", "Arbeitszentren in der Fertigung"),
+        ("Microsoft.Pricing.Asset", "Preisfindung für Anlagen"),
+        ("Microsoft.Pricing.Calculation", "Preisberechnung"),
+        ("Microsoft.Pricing.PriceList", "Preislistenverwaltung"),
+        ("Microsoft.Pricing.Reports", "Berichte zur Preisfindung"),
+        ("Microsoft.Pricing.Source", "Preisquellen"),
+        ("Microsoft.Pricing.Worksheet", "Arbeitsblätter zur Preisfindung"),
+        ("Microsoft.Projects.Project.Analysis", "Projektanalysen"),
+        ("Microsoft.Projects.Project.Archive", "Projektarchivierung"),
+        ("Microsoft.Projects.Project.Job", "Projektaufträge"),
+        ("Microsoft.Projects.Project.Journal", "Projektjournale"),
+        ("Microsoft.Projects.Project.Ledger", "Projekthauptbuch"),
+        ("Microsoft.Projects.Project.Planning", "Projektplanung"),
+        ("Microsoft.Projects.Project.Posting", "Projektbuchungen"),
+        ("Microsoft.Projects.Project.Pricing", "Projektpreisfindung"),
+        ("Microsoft.Projects.Project.Reports", "Projektberichte"),
+        ("Microsoft.Projects.Project.Setup", "Einrichtung des Projektbereichs"),
+        ("Microsoft.Projects.Project.WIP", "Work in Progress im Projektbereich"),
+        ("Microsoft.Projects.Resources.Analysis", "Analyse von Projektressourcen"),
+        ("Microsoft.Projects.Resources.Journal", "Journale für Projektressourcen"),
+        ("Microsoft.Projects.Resources.Ledger", "Hauptbuch für Projektressourcen"),
+        ("Microsoft.Projects.Resources.Pricing", "Preisfindung für Projektressourcen"),
+        ("Microsoft.Projects.Resources.Reports", "Berichte zu Projektressourcen"),
+        ("Microsoft.Projects.Resources.Resource", "Projektressourcenverwaltung"),
+        ("Microsoft.Projects.Resources.Setup", "Einrichtung der Projektressourcen"),
+        ("Microsoft.Projects.RoleCenters", "Rollencenter für Projekte"),
+        ("Microsoft.Projects.TimeSheet", "Projekt-Zeiterfassung"),
+        ("Microsoft.Purchases.Analysis", "Einkaufsanalysen"),
+        ("Microsoft.Purchases.Archive", "Archivierung von Einkaufsbelegen"),
+        ("Microsoft.Purchases.Comment", "Kommentare im Einkaufsbereich"),
+        ("Microsoft.Purchases.Document", "Einkaufsdokumente"),
+        ("Microsoft.Purchases.History", "Einkaufshistorie"),
+        ("Microsoft.Purchases.Payables", "Verbindlichkeiten im Einkauf"),
+        ("Microsoft.Purchases.Posting", "Buchungen im Einkauf"),
+        ("Microsoft.Purchases.Pricing", "Preisfindung im Einkauf"),
+        ("Microsoft.Purchases.Remittance", "Zahlungsavis im Einkauf"),
+        ("Microsoft.Purchases.Reports", "Berichte zum Einkauf"),
+        ("Microsoft.Purchases.RoleCenters", "Rollencenter für Einkauf"),
+        ("Microsoft.Purchases.Setup", "Einrichtung des Einkaufsbereichs"),
+        ("Microsoft.Purchases.Vendor", "Lieferantenverwaltung"),
+        ("Microsoft.RoleCenters", "Allgemeine Rollencenter"),
+        ("Microsoft.Sales.Analysis", "Verkaufsanalysen"),
+        ("Microsoft.Sales.Archive", "Archivierung von Verkaufsbelegen"),
+        ("Microsoft.Sales.Comment", "Kommentare im Verkaufsbereich"),
+        ("Microsoft.Sales.Customer", "Kundenverwaltung"),
+        ("Microsoft.Sales.Document", "Verkaufsdokumente"),
+        ("Microsoft.Sales.FinanceCharge", "Finanzierungsgebühren im Verkauf"),
+        ("Microsoft.Sales.History", "Verkaufshistorie"),
+        ("Microsoft.Sales.Peppol", "PEPPOL-Integration im Verkauf"),
+        ("Microsoft.Sales.Posting", "Buchungen im Verkauf"),
+        ("Microsoft.Sales.Pricing", "Preisfindung im Verkauf"),
+        ("Microsoft.Sales.Receivables", "Forderungen aus Lieferungen und Leistungen"),
+        ("Microsoft.Sales.Reminder", "Zahlungserinnerungen im Verkauf"),
+        ("Microsoft.Sales.Reports", "Berichte zum Verkauf"),
+        ("Microsoft.Sales.RoleCenters", "Rollencenter für Verkauf"),
+        ("Microsoft.Sales.Setup", "Einrichtung des Verkaufsbereichs"),
+        ("Microsoft.Service.Analysis", "Serviceanalysen"),
+        ("Microsoft.Service.Archive", "Archivierung von Servicebelegen"),
+        ("Microsoft.Service.BaseApp", "Service-Basisfunktionen"),
+        ("Microsoft.Service.CashFlow", "Servicebezogene Cashflow-Funktionen"),
+        ("Microsoft.Service.Comment", "Kommentare im Servicebereich"),
+        ("Microsoft.Service.Contract", "Serviceverträge"),
+        ("Microsoft.Service.Customer", "Servicekundenverwaltung"),
+        ("Microsoft.Service.Document", "Servicedokumente"),
+        ("Microsoft.Service.Email", "E-Mail-Kommunikation im Service"),
+        ("Microsoft.Service.History", "Servicehistorie"),
+        ("Microsoft.Service.Item", "Serviceartikelverwaltung"),
+        ("Microsoft.Service.Ledger", "Servicehauptbuch"),
+        ("Microsoft.Service.Loaner", "Leihstellungen im Service"),
+        ("Microsoft.Service.Maintenance", "Wartung im Servicebereich"),
+        ("Microsoft.Service.Posting", "Buchungen im Servicebereich"),
+        ("Microsoft.Service.Pricing", "Preisfindung im Service"),
+        ("Microsoft.Service.Reports", "Berichte zum Service"),
+        ("Microsoft.Service.Resources", "Servicebezogene Ressourcen"),
+        ("Microsoft.Service.RoleCenters", "Rollencenter für Service"),
+        ("Microsoft.Service.Setup", "Einrichtung des Servicebereichs"),
+        ("Microsoft.Shared.Report", "Geteilte Berichte und Reportings"),
+        ("Microsoft.System.Threading", "Nebenläufigkeit und Threading"),
+        ("Microsoft.Upgrade", "Upgrade- und Migrationsfunktionen"),
+        ("Microsoft.Utilities", "Hilfsfunktionen und Utilities"),
+        ("Microsoft.Warehouse.ADCS", "Automatisierte Datenerfassung im Lager"),
+        ("Microsoft.Warehouse.Activity", "Lageraktivitäten"),
+        ("Microsoft.Warehouse.Activity.History", "Historie der Lageraktivitäten"),
+        ("Microsoft.Warehouse.Availability", "Lagerverfügbarkeit"),
+        ("Microsoft.Warehouse.Comment", "Kommentare im Lagerbereich"),
+        ("Microsoft.Warehouse.CrossDock", "Cross-Docking im Lager"),
+        ("Microsoft.Warehouse.Document", "Lagerdokumente"),
+        ("Microsoft.Warehouse.History", "Lagerhistorie"),
+        ("Microsoft.Warehouse.InternalDocument", "Interne Lagerdokumente"),
+        ("Microsoft.Warehouse.InventoryDocument", "Bestandsdokumente im Lager"),
+        ("Microsoft.Warehouse.Journal", "Lagerjournale"),
+        ("Microsoft.Warehouse.Ledger", "Lagerhauptbuch"),
+        ("Microsoft.Warehouse.Posting", "Buchungen im Lagerbereich"),
+        ("Microsoft.Warehouse.Reports", "Berichte zum Lager"),
+        ("Microsoft.Warehouse.Request", "Lageranforderungen"),
+        ("Microsoft.Warehouse.RoleCenters", "Rollencenter für Lager"),
+        ("Microsoft.Warehouse.Setup", "Einrichtung des Lagerbereichs"),
+        ("Microsoft.Warehouse.Structure", "Lagerstruktur"),
+        ("Microsoft.Warehouse.Tracking", "Lagerverfolgung"),
+        ("Microsoft.Warehouse.Worksheet", "Lagerarbeitsblätter"),
+        ("Microsoft.costaccounting.Reports", "Berichte zur Kostenrechnung (Legacy)"),
+        ("Microsoft.eServices.OnlineMap", "Online-Kartendienste"),
+        ("System.AI", "Künstliche Intelligenz und Machine Learning"),
+        ("System.Apps", "Systemanwendungen und App-Management"),
+        ("System.Automation", "Automatisierungsfunktionen"),
+        ("System.Azure.Identity", "Azure-Identitätsdienste"),
+        ("System.DataAdministration", "Datenadministration und -management"),
+        ("System.DateTime", "Datum- und Zeitfunktionen"),
+        ("System.Device", "Geräteverwaltung"),
+        ("System.Diagnostics", "Diagnose- und Überwachungsfunktionen"),
+        ("System.EMail", "E-Mail-Kommunikation"),
+        ("System.Email", "E-Mail-Kommunikation"),
+        ("System.Environment", "Systemumgebung und Konfiguration"),
+        ("System.Environment.Configuration", "Konfiguration der Systemumgebung"),
+        ("System.Feedback", "Feedback- und Rückmeldungsfunktionen"),
+        ("System.Globalization", "Globalisierung und Lokalisierung"),
+        ("System.IO", "Datei- und Datenzugriff"),
+        ("System.Integration", "Systemintegration"),
+        ("System.Integration.PowerBI", "Power BI-Integration auf Systemebene"),
+        ("System.Media", "Medienverwaltung"),
+        ("System.Privacy", "Datenschutz und Privatsphäre"),
+        ("System.Reflection", "Reflexion und Metadaten"),
+        ("System.Security.AccessControl", "Zugriffssteuerung und Sicherheit"),
+        ("System.Security.Authentication", "Authentifizierungsfunktionen"),
+        ("System.Security.Encryption", "Verschlüsselung und Sicherheit"),
+        ("System.Security.User", "Benutzerverwaltung und -sicherheit"),
+        ("System.Telemetry", "Telemetrie und Überwachung"),
+        ("System.TestTools", "Testwerkzeuge und Testautomatisierung"),
+        ("System.TestTools.CodeCoverage", "Testabdeckung und Coverage"),
+        ("System.TestTools.TestRunner", "Testausführung"),
+        ("System.Text", "Textverarbeitung"),
+        ("System.Threading", "Nebenläufigkeit und Threading"),
+        ("System.Tooling", "Entwicklungswerkzeuge"),
+        ("System.Utilities", "Systemnahe Hilfsfunktionen"),
+        ("System.Visualization", "Visualisierung und Darstellung"),
+        ("System.Xml", "XML-Verarbeitung"),
+        # KUMAVISION Base (KBA)
+        ("UDI", "Unique Device Identification (KUMAVISION base/KBA)"),
+        ("Call", "Servicetickets und Anrufe (KUMAVISION base/KBA)"),
+        ("LIF", "Etikettenmanagement/handling (KUMAVISION base/KBA)"),
+        ("OrderQuote", "Angebots- und Auftragsverwaltung (KUMAVISION base/KBA)"),
+        ("InventorySummary", "Bestandsübersicht (KUMAVISION base/KBA)"),
+        ("Common", "KUMAVISION Basiskomponenten. Root Namespace"),
+        # HC/MTC-spezifisch       
+        ("ECE", "Elektronischer Datenaustausch (HC/MTC)"),
+        ("MDR", "Medical Device Regulation (HC/MTC)"),
+        ("Common", "Gemeinsame Komponenten für MTC/HC"),
+]
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
-OLLAMA_MODEL = "phi4:latest"
-EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest")
-LANCEDB_PATH = "./lancedb"
-LANCEDB_TABLE = "namespace_vectors"
-
-ALLOWED_NAMESPACES = {
-    # Microsoft Standard
-    "Warehouse", "Utilities", "System", "Service", "Sales", "RoleCenters", "Purchases", "Projects", "Profile",
-    "Pricing", "OtherCapabilities", "Manufacturing", "Invoicing", "Inventory", "Integration", "HumanResources",
-    "Foundation", "FixedAssets", "Finance", "eServices", "CRM", "CostAccounting", "CashFlow", "Bank", "Assembly", "API",
-    # KUMAVISION Base (KBA)
-    "UDI", "Call", "LIF", "OrderQuote", "InventorySummary", "Common",
-    # HC/MTC-spezifisch
-    "EDocuments", "ECE", "MDR"
-}
+allowed_namespaces = [ns for ns, desc in allowed_namespaces_with_desc]
 
 def find_al_files(root: str) -> List[str]:
     al_files = []
@@ -44,271 +392,141 @@ def find_al_files(root: str) -> List[str]:
                 al_files.append(os.path.join(dirpath, f))
     return al_files
 
-def extract_object_info(filepath: str) -> Optional[Tuple[str, str]]:
-    try:
-        with open(filepath, encoding="utf-8") as f:
-            for line in f:
-                match = OBJECT_PATTERN.match(line.strip())
-                if match:
-                    obj_type = match.group(1)
-                    obj_name = match.group(3)
-                    return obj_type, obj_name
-    except Exception:
-        pass
-    return None
+def extract_object_info(filepath: str):
+    with open(filepath, encoding="utf-8") as f:
+        lines = f.readlines()
+    obj_type, obj_name, namespace = None, None, None
+    for line in lines:
+        if not obj_type:
+            m = OBJECT_PATTERN.match(line.strip())
+            if m:
+                obj_type = m.group(1)
+                obj_name = m.group(3)
+        if not namespace:
+            n = NAMESPACE_PATTERN.search(line)
+            if n:
+                namespace = n.group(1) or n.group(2)
+        if obj_type and obj_name and namespace is not None:
+            break
+    al_code = "".join(lines)
+    return obj_type, obj_name, namespace, al_code
 
-def remove_prefix(name: str, prefix: str) -> str:
-    # Korrigiert: Case-insensitive Prefix-Entfernung
-    if name.upper().startswith(prefix.upper()):
-        return name[len(prefix):]
-    return name
+def extract_references(al_code: str) -> List[str]:
+    return list(set(m[1] for m in REF_PATTERN.findall(al_code)))
 
-def get_embedding(text: str) -> List[float]:
-    payload = {
-        "model": EMBED_MODEL,
-        "prompt": text
-    }
-    try:
-        response = requests.post(OLLAMA_EMBED_URL, json=payload, timeout=300)
-        response.raise_for_status()
-        result = response.json()
-        embedding = result.get("embedding")
-        if not embedding or not isinstance(embedding, list):
-            raise ValueError("No embedding returned from Ollama.")
-        return embedding
-    except Exception as e:
-        print(f"Embedding-Fehler: {e}")
-        return [0.0] * 1024
+def index_al_objects(roots: List[str]) -> Dict[str, Dict]:
+    """Indexiere alle AL-Objekte nach Name (case-insensitive)."""
+    index = {}
+    for root in roots:
+        for filepath in find_al_files(root):
+            try:
+                obj_type, obj_name, namespace, al_code = extract_object_info(filepath)
+                if obj_type and obj_name:
+                    key = obj_name.lower()
+                    index[key] = {
+                        "object_type": obj_type,
+                        "object_name": obj_name,
+                        "namespace": namespace,
+                        "filepath": filepath,
+                        "al_code": al_code
+                    }
+            except Exception:
+                continue
+    return index
 
-def retrieve_context(object_type: str, object_name: str, top_k: int = 3) -> List[Dict]:
-    # Initialisiere LanceDB
-    db = lancedb.connect(LANCEDB_PATH)
-    table = db.open_table(LANCEDB_TABLE)
-    # Erzeuge Embedding für Suchtext
-    query_text = f"{object_type} {object_name}"
-    query_emb = get_embedding(query_text)
-    # Suche nach ähnlichsten Einträgen
-    try:
-        results = table.search(query_emb).limit(top_k).to_list()
-        return results
-    except Exception as e:
-        print(f"LanceDB Retrieval-Fehler: {e}")
-        return []
-
-NAMESPACE_OVERVIEW = """
-1. Microsoft Standard:
-   - Warehouse: Lagerverwaltung, Lagerbewegungen, Lagerorte, Lagerlogistik
-   - Utilities: Hilfsfunktionen, technische Werkzeuge, allgemeine Tools
-   - System: Systemobjekte, technische Infrastruktur, Systemprozesse
-   - Service: Serviceaufträge, Serviceartikel, Serviceprozesse
-   - Sales: Verkauf, Verkaufsbelege, Verkaufsprozesse
-   - RoleCenters: Rollencenter, Benutzeroberflächen für Rollen
-   - Purchases: Einkauf, Einkaufsbelege, Einkaufsprozesse
-   - Projects: Projektmanagement, Projektaufträge, Projektplanung
-   - Profile: Benutzerprofile, Einstellungen für Benutzer
-   - Pricing: Preisfindung, Preislisten, Rabatte
-   - OtherCapabilities: Sonstige Fähigkeiten, Zusatzfunktionen
-   - Manufacturing: Fertigung, Produktionsaufträge, Stücklisten
-   - Invoicing: Rechnungsstellung, Fakturierung
-   - Inventory: Bestandsführung, Lagerbestände
-   - Integration: Schnittstellen, externe Anbindungen, Integration
-   - HumanResources: Personalverwaltung, Mitarbeiterdaten
-   - Foundation: Grundfunktionen, Basiskomponenten
-   - FixedAssets: Anlagenbuchhaltung, Anlagegüter
-   - Finance: Finanzbuchhaltung, Buchungen, Konten
-   - eServices: Elektronische Dienste, Online-Services
-   - CRM: Kundenbeziehungsmanagement, Kontakte, Aktivitäten
-   - CostAccounting: Kostenrechnung, Kostenstellen
-   - CashFlow: Liquiditätsplanung, Zahlungsströme
-   - Bank: Bankkonten, Zahlungsverkehr
-   - Assembly: Montage, Baugruppen
-   - API: Programmierschnittstellen, externe Zugriffe
-
-2. KUMAVISION Base (KBA):
-   - UDI: Unique Device Identification, Medizinprodukte-Kennzeichnung
-   - Call: Service-Calls, Außendienst-Einsätze
-   - LIF: Lieferantenmanagement, Lieferantenintegration
-   - OrderQuote: Angebote, Auftragsangebote
-   - InventorySummary: Lagerübersicht, Bestandszusammenfassung
-   - Common: Basiskomponenten, allgemeine Funktionen (Root für KBA)
-
-3. Healthcare-/MEDTEC-spezifisch:
-   - EDocuments: Elektronisches & digitales Dokumentenhandling (z.B. eRechnung, eArztbrief)
-   - ECE: Electron Cost Estimation, elektronische Kostenkalkulation
-   - MDR: Medical Device Regulation, regulatorische Anforderungen für Medizinprodukte
-   - Common: Basiskomponenten, allgemeine Funktionen (Root für HC/MTC)
-"""
-
-def ollama_namespace_prompt(object_type: str, object_name: str, filename: str, context: List[Dict], hc_obj: dict, mtc_obj: dict, extension_context: List[Dict] = None, extension_base: str = None) -> str:
-    context_str = ""
-    for idx, ctx in enumerate(context, 1):
-        ctx_type = ctx.get("object_type", "")
-        ctx_name = ctx.get("object_name", "")
-        ctx_ns = ctx.get("namespace", "")
-        ctx_dir = ctx.get("directory", "")
-        ctx_content = ctx.get("content", "")[:300].replace("\n", " ")
-        context_str += f"\nKontext {idx}: Typ: {ctx_type}, Name: {ctx_name}, Namespace: {ctx_ns}, Verzeichnis: {ctx_dir}, Auszug: {ctx_content}"
-
-    hc_name = hc_obj.get("object_name", "")
-    mtc_name = mtc_obj.get("object_name", "")
-    hc_info = f"HC-Objektname: {hc_name}" if hc_name else ""
-    mtc_info = f"MTC-Objektname: {mtc_name}" if mtc_name else ""
-    both_info = ", ".join(filter(None, [hc_info, mtc_info]))
-
-    namespace_rules = (
-        "WICHTIG: "
-        "Du darfst ausschließlich einen der folgenden Namespaces verwenden und KEINEN anderen: "
-        "Warehouse, Utilities, System, Service, Sales, RoleCenters, Purchases, Projects, Profile, Pricing, OtherCapabilities, Manufacturing, Invoicing, Inventory, Integration, HumanResources, Foundation, FixedAssets, Finance, eServices, CRM, CostAccounting, CashFlow, Bank, Assembly, API, "
-        "UDI, Call, LIF, OrderQuote, InventorySummary, Common, "
-        "EDocuments, ECE, MDR. "
-        "Erfinde KEINE neuen Namespaces, verwende KEINE Präfixe oder Kombinationen wie 'HC.MTC.Common', 'HC.MDR' oder ähnliches. "
-        "Wenn ein Objekt mehreren Bereichen zugeordnet werden kann oder übergreifend ist, dann wähle ausschließlich den Namespace 'Common' (Root-Ebene). "
-        "Jede andere Antwort als einer der oben genannten Namespaces ist FALSCH."
-    )
-
-    related_hint = (
-        "Hinweis: Wenn es Objekte mit ähnlichem Namen oder sehr ähnlicher Funktionalität gibt (z.B. 'AdditionalFieldEventLib' und 'AdditionalFieldLib'), "
-        "sollten diese nach Möglichkeit im gleichen Namespace landen, außer es gibt einen klaren fachlichen Grund für eine Trennung."
-    )
-
-    # Prompt für Extension-Objekte
-    if extension_context and extension_base:
-        ext_ctx = extension_context[0] if extension_context else {}
-        ext_ns = ext_ctx.get("namespace", "")
-        ext_type = ext_ctx.get("object_type", "")
-        ext_name = ext_ctx.get("object_name", "")
-        ext_dir = ext_ctx.get("directory", "")
-        ext_info = f"Das Objekt erweitert {ext_type} '{ext_name}' (Namespace: {ext_ns}, Verzeichnis: {ext_dir})."
-        return (
-            f"Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung. "
-            f"Für das folgende Extension-Objekt soll ein passender Namespace vorgeschlagen werden. "
-            f"{ext_info}\n"
-            f"Der Namespace der Extension MUSS sich am Namespace des erweiterten Objekts orientieren. "
-            f"{namespace_rules}\n"
-            f"{related_hint}\n"
-            f"Hier ist eine Übersicht der bislang verfügbaren Namespaces:\n{NAMESPACE_OVERVIEW}\n"
-            f"Objekttyp: {object_type}, Objektname: {object_name}, Dateiname: {filename}. {both_info}\n"
-            f"Berücksichtige folgende ähnliche Objekte aus Base Application und KBA:{context_str}\n"
-            f"Deine Aufgabe:\n"
-            f"- Schlage einen passenden Namespace aus obiger Liste vor (bevorzugt den Namespace des erweiterten Objekts).\n"
-            f"- Begründe deine Entscheidung.\n"
-            f"- Schlage wenn möglich alternative Namespaces aus der Liste vor und begründe diese Alternativen.\n"
-            f"Gib das Ergebnis als JSON im folgenden Format zurück:\n"
-            f'{{"namespace": "...", "reason": "...", "alternatives": [{{"namespace": "...", "reason": "..."}}]}}'
-        )
-    # Prompt für andere Objekte
-    else:
-        return (
-            f"Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung. "
-            f"Für das folgende Objekt aus den Lösungen HC (Healthcare) und/oder MTC (Medtec) soll ein passender Namespace vorgeschlagen werden. "
-            f"Beachte: Beide Apps stammen aus einem gemeinsamen Ursprung und haben eine Abhängigkeit zu KUMAVISION Base (KBA) und Microsoft Base Application. "
-            f"Die KBA hat noch keine Namespaces, aber das Verzeichnis gibt einen Hinweis auf den zukünftigen Namespace. "
-            f"Die Base Application verwendet bereits Namespaces, die möglichst eingehalten werden sollten. "
-            f"{namespace_rules}\n"
-            f"{related_hint}\n"
-            f"Hier ist eine Übersicht der bislang verfügbaren Namespaces:\n{NAMESPACE_OVERVIEW}\n"
-            f"Objekttyp: {object_type}, Objektname: {object_name}, Dateiname: {filename}. {both_info}\n"
-            f"Berücksichtige folgende ähnliche Objekte aus Base Application und KBA:{context_str}\n"
-            f"Deine Aufgabe:\n"
-            f"- Analysiere den Kernaspekt des Objekts (z.B. Zweck, verwendete Objekte, Schlüsselwörter).\n"
-            f"- Prüfe, ob ein existierender Namespace aus der Liste passt oder ob bekannte Namespaces im Objekt verwendet werden.\n"
-            f"- Schlage einen passenden Namespace aus obiger Liste vor.\n"
-            f"- Begründe deine Entscheidung.\n"
-            f"- Schlage wenn möglich alternative Namespaces aus der Liste vor und begründe diese Alternativen.\n"
-            f"Gib das Ergebnis als JSON im folgenden Format zurück:\n"
-            f'{{"namespace": "...", "reason": "...", "alternatives": [{{"namespace": "...", "reason": "..."}}]}}'
-        )
-
-def extract_extended_object(content: str) -> Optional[Tuple[str, str]]:
+def index_al_objects_with_type_and_name(roots: List[str]) -> Dict[Tuple[str, str], Dict]:
     """
-    Extrahiert das erweiterte Objekt bei Extension-Objekten (z.B. tableextension 50100 "MyTableExt" extends "BaseTable")
-    Gibt (Typ, Name) zurück oder None.
+    Indexiere alle AL-Objekte nach (object_type.lower(), object_name.lower()).
+    Liefert Dict mit Typ und Name als Schlüssel, damit Referenzen besser aufgelöst werden können.
+    Fortschrittsanzeige mit tqdm.
     """
-    import re
-    match = re.search(r'^(tableextension|pageextension|enumextension|reportextension|permissionsetextension)\s+\d+\s+"?([\w\d_]+)"?\s+extends\s+"?([\w\d_]+)"?', content, re.IGNORECASE | re.MULTILINE)
-    if match:
-        ext_type = match.group(1)
-        base_name = match.group(3)
-        return ext_type, base_name
-    return None
-
-def retrieve_context_for_extension(base_object_name: str, base_object_type: str = None, top_k: int = 1) -> List[Dict]:
-    # Suche gezielt nach dem Basisobjekt in LanceDB
-    db = lancedb.connect(LANCEDB_PATH)
-    table = db.open_table(LANCEDB_TABLE)
-    filter_expr = f"object_name = '{base_object_name}'"
-    if base_object_type:
-        filter_expr += f" and object_type = '{base_object_type}'"
-    try:
-        results = table.search(filter=None, where=filter_expr).limit(top_k).to_list()
-        return results
-    except Exception as e:
-        print(f"LanceDB Extension-Retrieval-Fehler: {e}")
-        return []
-
-def validate_namespace(ns: str) -> str:
-    return ns if ns in ALLOWED_NAMESPACES else "INVALID"
-
-def validate_alternatives(alternatives: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    return [(ns, reason) for ns, reason in alternatives if ns in ALLOWED_NAMESPACES]
-
-def suggest_namespace_ollama(object_type: str, object_name: str, filename: str, hc_obj: dict, mtc_obj: dict) -> Tuple[str, str, List[Tuple[str, str]], str, List[str]]:
-    # Hole den Dateipfad für den Content
-    filepath = None
-    if hc_obj.get("filename"):
-        filepath = os.path.join(HC_ROOT, hc_obj["filename"])
-    elif mtc_obj.get("filename"):
-        filepath = os.path.join(MTC_ROOT, mtc_obj["filename"])
-    content = ""
-    if filepath and os.path.exists(filepath):
+    index = {}
+    all_files = []
+    for root in roots:
+        all_files.extend(find_al_files(root))
+    for filepath in tqdm(all_files, desc="Indexiere AL-Objekte", unit="Datei"):
         try:
-            with open(filepath, encoding="utf-8") as f:
-                content = f.read()
+            obj_type, obj_name, namespace, al_code = extract_object_info(filepath)
+            if obj_type and obj_name:
+                key = (obj_type.lower(), obj_name.lower())
+                index[key] = {
+                    "object_type": obj_type,
+                    "object_name": obj_name,
+                    "namespace": namespace,
+                    "filepath": filepath,
+                    "al_code": al_code
+                }
         except Exception:
-            pass
+            continue
+    return index
 
-    # Prüfe auf Extension-Objekt
-    ext_info = extract_extended_object(content) if content else None
-    extension_context = []
-    extension_base = None
-    if ext_info:
-        ext_type, base_name = ext_info
-        extension_base = base_name
-        # Suche gezielt nach dem Basisobjekt in LanceDB
-        extension_context = retrieve_context_for_extension(base_name)
-        # Fallback: Wenn nichts gefunden, Standard-Kontext
-        if not extension_context:
-            extension_context = retrieve_context(object_type, object_name, top_k=3)
-    else:
-        extension_context = None
+def extract_reference_tuples(al_code: str) -> List[Tuple[str, str]]:
+    """
+    Extrahiere Referenzen als (object_type, object_name)-Tupel aus dem AL-Code.
+    """
+    refs = []
+    for m in REF_PATTERN.findall(al_code):
+        # m[0] oder m[2] ist der Typ, m[1] oder m[3] ist der Name
+        if m[1]:
+            refs.append((m[0].lower(), m[1].lower()))
+        elif m[3]:
+            refs.append((m[2].lower(), m[3].replace('"', '').lower()))
+    return list(set(refs))
 
-    # Standard-Kontext für alle Objekte
-    context = retrieve_context(object_type, object_name, top_k=3)
-
-    prompt = ollama_namespace_prompt(
-        object_type,
-        object_name,
-        filename,
-        context,
-        hc_obj,
-        mtc_obj,
-        extension_context=extension_context if ext_info else None,
-        extension_base=extension_base
+def suggest_namespace_llm(obj_info, ref_infos):
+    prompt = (
+        "Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung und die Vergabe von Namespaces.\n"
+        "Analysiere das folgende AL-Objekt und schlage einen passenden Namespace vor. "
+        "Beziehe dich dabei auf die Namenskonventionen der Microsoft Base Application. "
+        "Wenn im Standard (Base Application) für ein Objekt oder dessen Funktionalität bereits ein Namespace wie z.B. 'System', 'Sales', etc. verwendet wird, "
+        "sollen die HC- und MTC-Objekte möglichst denselben Namespace verwenden. "
+        "Die Entscheidung für den Namespace soll sich vorrangig an den Objekten der Base Application orientieren.\n"
+        "Falls ein anderer Namespace sinnvoller ist, begründe dies nachvollziehbar.\n"
+        "Die Begründung (\"reason\") und alle Alternativen im JSON-Output müssen ausschließlich auf DEUTSCH formuliert sein.\n"
+        "Du darfst ausschließlich einen Namespace aus folgender Liste verwenden (keinen anderen):\n"
+        "WICHTIG: Gib im Feld \"namespace\" ausschließlich den Kurznamen (z.B. 'EServices', 'EDocuments', 'Finance', 'Inventory', etc.) aus der Liste an – NICHT den vollständigen Namespace-Pfad wie 'Microsoft.EServices.EDocument' oder 'System.Environment.Configuration'!\n"
+        "Wenn ein Namespace-Pfad wie 'System.Environment.Configuration' in der Liste steht, darfst du nur einen einzelnen Teil daraus wählen, z.B. entweder 'Environment' oder 'Configuration', aber niemals den gesamten Pfad oder mehrere Teile kombiniert.\n"
+        "Beispiel für den Output:\n"
+        '{"namespace": "Environment", "reason": "...", "alternatives": [{"namespace": "Configuration", "reason": "..."}]}'
     )
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False
-    }
+    prompt += "\n".join([f"- {ns}: {desc}" for ns, desc in allowed_namespaces_with_desc])
+    prompt += (
+        "\nFalls keiner dieser Namespaces fachlich passt, wähle 'Custom' und begründe dies ausführlich.\n"
+        f"\nObjekttyp: {obj_info['object_type']}\n"
+        f"Objektname: {obj_info['object_name']}\n"
+        f"AL-Code:\n{obj_info['al_code']}\n"
+    )
+    if ref_infos:
+        prompt += "\nKontext zu referenzierten Objekten:\n"
+        for ref in ref_infos:
+            prompt += f"- Name: {ref.get('object_name','')}, Namespace: {ref.get('namespace','')}\n"
+    prompt += (
+        "\nDeine Aufgabe:\n"
+        "- Analysiere, ob und wie das Objekt oder ähnliche Objekte in der Base Application einem bestimmten Namespace zugeordnet sind.\n"
+        "- Schlage einen passenden Namespace aus der Liste der erlaubten Namespaces vor (bevorzugt den Namespace der Base Application, falls vorhanden).\n"
+        "- Begründe deine Entscheidung ausführlich in deutscher Sprache.\n"
+        "- Schlage, falls sinnvoll, alternative Namespaces vor und begründe diese Alternativen in deutscher Sprache.\n"
+        "Gib das Ergebnis als JSON im folgenden Format zurück (ALLE Begründungen auf DEUTSCH!):\n"
+        '{"namespace": "...", "reason": "...", "alternatives": [{"namespace": "...", "reason": "..."}]}'
+        "Deine Empfehlung:"
+    )
+    llm = AzureChatOpenAI(
+        openai_api_key=OPENAI_API_KEY,
+        azure_endpoint=OPENAI_API_BASE,
+        openai_api_version=OPENAI_API_VERSION,
+        deployment_name=OPENAI_DEPLOYMENT,
+        temperature=0.7,
+        max_tokens=800,
+    )
+    messages = [
+        SystemMessage(content="Du bist ein erfahrener AL-Entwickler und Namespace-Experte."),
+        HumanMessage(content=prompt)
+    ]
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        response.raise_for_status()
-        result = response.json()
+        response = llm.invoke(messages)
         import json as pyjson
-        text = result.get("response", "")
-        print(f"\n--- Ollama Antwort für {object_type} {object_name} ---\n{text}\n")  # Debug-Ausgabe
+        text = response.content
         match = re.search(r'\{.*\}', text, re.DOTALL)
-        considered_namespaces = []
         if match:
             data = pyjson.loads(match.group(0))
             ns = data.get("namespace", "")
@@ -316,162 +534,134 @@ def suggest_namespace_ollama(object_type: str, object_name: str, filename: str, 
             alternatives = []
             for alt in data.get("alternatives", []):
                 alternatives.append((alt.get("namespace", ""), alt.get("reason", "")))
-            # Validierung
-            valid_ns = validate_namespace(ns)
-            valid_alternatives = validate_alternatives(alternatives)
-            # Analyse-Hinweis bei ungültigem Namespace
-            if valid_ns == "INVALID":
-                reason = f"Ungültiger Namespace '{ns}' vorgeschlagen. Nur folgende sind erlaubt: {', '.join(sorted(ALLOWED_NAMESPACES))}. Grund laut Modell: {reason}"
-            considered_namespaces.append(f"Hauptvorschlag: {valid_ns} - {reason}")
-            for alt in valid_alternatives:
-                considered_namespaces.append(f"Alternative: {alt[0]} - {alt[1]}")
-            return valid_ns, reason, valid_alternatives, text, considered_namespaces
+            return ns, reason, alternatives, text
         else:
-            return "", "Konnte kein JSON aus Ollama-Antwort extrahieren.", [], text, []
+            return "", "Konnte kein JSON aus Azure OpenAI-Antwort extrahieren.", [], text
     except Exception as e:
-        return "", f"Ollama-Fehler: {e}", [], "", []
+        return "", f"Azure OpenAI-Fehler: {e}", [], ""
+
+HC_PREFIX = "KVSMED"
+MTC_PREFIX = "KVSMTC"
+
+def remove_prefix(name: str, prefix: str) -> str:
+    if name.upper().startswith(prefix.upper()):
+        return name[len(prefix):]
+    return name
+
+def build_hc_mtc_object_map(analyze_obj_index):
+    """
+    Gruppiert Objekte aus HC und MTC nach Typ und Namen ohne Prefix.
+    Gibt Dict mit key = (object_type, name_ohne_prefix) und value = {"hc": {...}, "mtc": {...}}
+    """
+    grouped = {}
+    for (otype, oname), obj in analyze_obj_index.items():
+        if oname.upper().startswith(HC_PREFIX):
+            name_noprefix = remove_prefix(oname, HC_PREFIX)
+            key = (otype, name_noprefix.lower())
+            grouped.setdefault(key, {})["hc"] = obj
+        elif oname.upper().startswith(MTC_PREFIX):
+            name_noprefix = remove_prefix(oname, MTC_PREFIX)
+            key = (otype, name_noprefix.lower())
+            grouped.setdefault(key, {})["mtc"] = obj
+        else:
+            # Falls kein Prefix, trotzdem aufnehmen (z.B. für Basiskomponenten)
+            key = (otype, oname.lower())
+            grouped.setdefault(key, {})["hc"] = obj  # Default zu HC
+    return grouped
 
 def read_existing_csv(csv_path: str) -> set:
-    existing_keys = set()
+    """
+    Lese bereits analysierte Objekte aus der CSV (ObjectType, HC ObjectName, MTC ObjectName als Schlüssel).
+    """
+    done = set()
     if not os.path.exists(csv_path):
-        return existing_keys
+        return done
     with open(csv_path, newline='', encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Nutze ObjectType + ObjectName HC + ObjectName MTC als Schlüssel
             key = (
                 row.get("ObjectType", "").strip().lower(),
-                row.get("ObjectName HC", "").strip().lower(),
-                row.get("ObjectName MTC", "").strip().lower()
+                row.get("HC ObjectName", "").strip().lower(),
+                row.get("MTC ObjectName", "").strip().lower()
             )
-            existing_keys.add(key)
-    return existing_keys
+            done.add(key)
+    return done
 
-def collect_objects(root: str, prefix: str) -> Dict[str, Dict]:
-    result = {}
-    for filepath in find_al_files(root):
-        info = extract_object_info(filepath)
-        if not info:
-            continue
-        obj_type, obj_name = info
-        obj_name_noprefix = remove_prefix(obj_name, prefix)
-        # ACHTUNG: Key muss aus obj_type und obj_name_noprefix bestehen, aber obj_name_noprefix muss wirklich NUR das Prefix entfernen!
-        # Fehlerquelle: remove_prefix ist case-sensitive und prüft nur auf Großbuchstaben!
-        # Besser: Case-insensitive Prefix-Entfernung
-        if obj_name.upper().startswith(prefix.upper()):
-            obj_name_noprefix = obj_name[len(prefix):]
-        else:
-            obj_name_noprefix = obj_name
-        key = f"{obj_type.lower()}|{obj_name_noprefix.lower()}"
-        result[key] = {
-            "object_type": obj_type,
-            "object_name": obj_name,
-            "object_name_noprefix": obj_name_noprefix,
-            "filename": os.path.basename(filepath)
-        }
-    return result
-
-def build_row(key, hc_objs, mtc_objs):
-    hc = hc_objs.get(key, {})
-    mtc = mtc_objs.get(key, {})
-
-    object_type = hc.get("object_type") or mtc.get("object_type") or ""
-    # Hier wird jeweils das Original aus HC und MTC verwendet:
-    object_name_hc = hc.get("object_name", "")
-    object_name_mtc = mtc.get("object_name", "")
-    filename = hc.get("filename") or mtc.get("filename") or ""
-
-    suggest_base = hc or mtc
-    ns, ns_reason, alternatives, analyse, considered_namespaces = suggest_namespace_ollama(
-        object_type,
-        suggest_base.get("object_name_noprefix", ""),
-        filename,
-        hc,
-        mtc
-    )
-    alt_ns = "; ".join([a[0] for a in alternatives])
-    alt_reason = "; ".join([a[1] for a in alternatives])
-
-    considered_str = " | ".join(considered_namespaces)
-    analyse_full = f"{analyse.strip().replace(chr(10), ' ')} --- Überlegung der Namespaces: {considered_str}"
-
-    # Schreibe nur, wenn kein JSON-Fehler oder INVALID Namespace
-    if ns == "" or ns == "INVALID" or "Konnte kein JSON aus Ollama-Antwort extrahieren." in ns_reason or "Ollama-Fehler" in ns_reason:
-        return None
-
-    return {
-        "ObjectType": object_type,
-        "ObjectName HC": object_name_hc,
-        "ObjectName MTC": object_name_mtc,
-        "Namespace Vorschlag": ns,
-        "Namespace Begründung": ns_reason,
-        "Alternative Namespace Vorschlag": alt_ns,
-        "Alternative Namespace Begründung": alt_reason,
-        "Dateiname": filename,
-        "Analyse": analyse_full
-    }
+import time
 
 def main():
-    hc_objs = collect_objects(HC_ROOT, PREFIX_HC)
-    mtc_objs = collect_objects(MTC_ROOT, PREFIX_MTC)
-
-    # Matching: gleiche Objekte (gleicher Typ + Name ohne Prefix) sollen im selben Namespace landen
-    # Die Schlüssel sind bereits normalisiert (siehe collect_objects)
-    all_keys = list(sorted(set(hc_objs.keys()).union(mtc_objs.keys())))
-
-    # Lade bestehende Ergebnisse
-    existing_keys = read_existing_csv(CSV_OUTPUT)
-
-    # Keine Begrenzung mehr auf 10 Einträge
-    test_keys = all_keys
-
-    # Filtere nur neue Objekte
-    filtered_keys = []
-    for key in test_keys:
-        hc = hc_objs.get(key, {})
-        mtc = mtc_objs.get(key, {})
-        obj_type = hc.get("object_type") or mtc.get("object_type") or ""
-        # Wichtig: Für die CSV-Spalte "ObjectName HC" und "ObjectName MTC" muss jeweils das Original aus hc_objs bzw. mtc_objs verwendet werden!
-        obj_name_hc = hc.get("object_name", "")
-        obj_name_mtc = mtc.get("object_name", "")
-        csv_key = (obj_type.strip().lower(), obj_name_hc.strip().lower(), obj_name_mtc.strip().lower())
-        if csv_key not in existing_keys:
-            filtered_keys.append(key)
-
-    import time
-    start_time = time.time()
+    # Index für Referenz-Kontext (alle Roots)
+    ref_obj_index = index_al_objects_with_type_and_name(SEARCH_ROOTS)
+    # Index für zu analysierende Objekte (nur HC/MTC)
+    analyze_obj_index = index_al_objects_with_type_and_name(ANALYZE_ROOTS)
+    grouped = build_hc_mtc_object_map(analyze_obj_index)
 
     fieldnames = [
         "ObjectType",
-        "ObjectName HC",
-        "ObjectName MTC",
+        "HC ObjectName",
+        "MTC ObjectName",
         "Namespace Vorschlag",
         "Namespace Begründung",
         "Alternative Namespace Vorschlag",
         "Alternative Namespace Begründung",
-        "Dateiname",
+        "Dateipfad",
         "Analyse"
     ]
+
+    already_done = read_existing_csv(CSV_OUTPUT)
+    total = len(grouped)
+    processed_tokens = 0
+    start_time = time.time()
+    avg_tokens_per_obj = 2000
 
     write_header = not os.path.exists(CSV_OUTPUT) or os.stat(CSV_OUTPUT).st_size == 0
     with open(CSV_OUTPUT, "a", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(build_row, key, hc_objs, mtc_objs) for key in filtered_keys]
-            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Namespace-Vorschläge", unit="Objekt")):
-                row = future.result()
-                if row is not None:
-                    writer.writerow(row)
-                    csvfile.flush()
-                elapsed = time.time() - start_time
-                avg = elapsed / (i + 1) if i + 1 > 0 else 0
-                remaining = avg * (len(futures) - (i + 1))
-                print(f"Bearbeitet: {i+1}/{len(futures)} | Verstrichen: {elapsed:.1f}s | Ø {avg:.1f}s/Objekt | Rest: {remaining/60:.1f}min")
-
-    # Kein Sammeln und Sortieren im Speicher mehr nötig
+        for idx, ((otype, name_noprefix), obj_pair) in enumerate(tqdm(grouped.items(), desc="Namespace-Vorschläge", unit="Objekt", total=total), 1):
+            hc_obj = obj_pair.get("hc")
+            mtc_obj = obj_pair.get("mtc")
+            hc_name = hc_obj["object_name"] if hc_obj else ""
+            mtc_name = mtc_obj["object_name"] if mtc_obj else ""
+            key = (otype, hc_name.lower(), mtc_name.lower())
+            if key in already_done:
+                continue
+            # Für die Analyse: bevorzugt HC, sonst MTC
+            obj_info = hc_obj or mtc_obj
+            if not obj_info:
+                continue
+            # Referenzen analysieren (mit Typ und Name, Kontext aus ref_obj_index)
+            ref_infos = []
+            if obj_info["al_code"]:
+                for ref_type, ref_name in extract_reference_tuples(obj_info["al_code"]):
+                    ref_obj = ref_obj_index.get((ref_type, ref_name))
+                    if ref_obj:
+                        ref_infos.append({"object_type": ref_obj["object_type"], "object_name": ref_obj["object_name"], "namespace": ref_obj["namespace"]})
+            ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos)
+            alt_ns = "; ".join([a[0] for a in alternatives])
+            alt_reason = "; ".join([a[1] for a in alternatives])
+            writer.writerow({
+                "ObjectType": otype,
+                "HC ObjectName": hc_name,
+                "MTC ObjectName": mtc_name,
+                "Namespace Vorschlag": ns,
+                "Namespace Begründung": reason,
+                "Alternative Namespace Vorschlag": alt_ns,
+                "Alternative Namespace Begründung": alt_reason,
+                "Dateipfad": (hc_obj["filepath"] if hc_obj else "") or (mtc_obj["filepath"] if mtc_obj else ""),
+                "Analyse": analyse.strip().replace(chr(10), ' ')
+            })
+            csvfile.flush()
+            processed_tokens += avg_tokens_per_obj
+            elapsed = time.time() - start_time
+            avg_time = elapsed / idx if idx > 0 else 0
+            remaining = total - idx
+            tokens_per_minute = 100_000
+            expected_time_for_tokens = processed_tokens / tokens_per_minute * 60
+            eta = max((remaining * avg_time), (expected_time_for_tokens - elapsed))
+            print(f"Bearbeitet: {idx}/{total} | Verstrichen: {elapsed:.1f}s | Ø {avg_time:.1f}s/Objekt | ETA: {eta/60:.1f}min", end="\r")
+            time.sleep(0.2)
 
 if __name__ == "__main__":
     main()
