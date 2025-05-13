@@ -9,7 +9,7 @@ import hashlib
 
 # -------------------- KONSTANTEN --------------------
 OBJECT_NAME_TO_REVIEW = "KVSMEDCLLCMBGeneralMgtSub"  # <--- Setze hier den gewünschten Objektnamen
-HC_ROOT = "C:/Repos/DevOps/HC-Work/Product_MED\Product_MED_AL/app/"
+HC_ROOT = "C:/Repos/DevOps/HC-Work/Product_MED/Product_MED_AL/app/"
 MTC_ROOT = "C:/Repos/DevOps/MTC-Work/Product_MED_Tech365/Product_MED_Tech/app/"
 
 CSV_PATH = "namespace_suggestions.csv"
@@ -52,7 +52,7 @@ def retrieve_context(object_type, object_name, top_k=3):
     except Exception:
         return []
 
-def build_rag_prompt(object_name, object_rows, context_objects=None):
+def build_rag_prompt(object_name, object_rows, al_content, context_objects=None, ref_contexts=None):
     context = ""
     for idx, row in enumerate(object_rows, 1):
         context += (
@@ -88,6 +88,7 @@ def build_rag_prompt(object_name, object_rows, context_objects=None):
         "\n"
         f"Hier sind die grundlegenden Objektinformationen:\n{context}\n"
         f"Hier sind ähnliche Objekte aus der Base Application oder KBA (Kontext für RAG):\n{rag_context}\n"
+        f"\nHier ist der vollständige AL-Code des Objekts:\n\n{al_content}\n"
         "Deine Aufgabe:\n"
         "- Analysiere, ob und wie das Objekt oder ähnliche Objekte in der Base Application einem bestimmten Namespace zugeordnet sind.\n"
         "- Schlage einen passenden Namespace aus der Liste der erlaubten Namespaces vor (bevorzugt den Namespace der Base Application, falls vorhanden).\n"
@@ -97,6 +98,17 @@ def build_rag_prompt(object_name, object_rows, context_objects=None):
         '{"namespace": "...", "reason": "...", "alternatives": [{"namespace": "...", "reason": "..."}]}'
         "Deine Empfehlung:"
     )
+    if ref_contexts:
+        prompt += "\nKontext zu referenzierten Objekten:\n"
+        for i, ctx in enumerate(ref_contexts, 1):
+            prompt += (
+                f"\n--- Referenziertes Objekt {i} ---\n"
+                f"Objekttyp: {ctx.get('object_type','')}\n"
+                f"Objektname: {ctx.get('object_name','')}\n"
+                f"Namespace: {ctx.get('namespace','')}\n"
+                f"Dateiname: {ctx.get('filename','')}\n"
+                f"Verzeichnis: {ctx.get('directory','')}\n"
+            )
     return prompt
 
 def query_azure_openai(prompt):
@@ -427,6 +439,39 @@ def find_al_file_by_partial_name(object_name, roots):
                     return filepath
     return None
 
+def extract_referenced_objects_from_al(content):
+    """
+    Extrahiert referenzierte Objekte (z.B. Table, Page, Codeunit) aus AL-Code.
+    Gibt eine Liste von (object_type, object_name) zurück.
+    """
+    import re
+    patterns = [
+        re.compile(r'(Table|Page|Codeunit|Report|XmlPort|Query|Enum)\s*::\s*"?([\w\d_]+)"?', re.IGNORECASE),
+        re.compile(r'(Table|Page|Codeunit|Report|XmlPort|Query|Enum)\s*\(\s*"?([\w\d_]+)"?\s*\)', re.IGNORECASE)
+    ]
+    refs = set()
+    for pat in patterns:
+        for m in pat.findall(content):
+            refs.add((m[0].lower(), m[1]))
+    return list(refs)
+
+def retrieve_context_for_references(refs, top_k=2):
+    """Holt Kontextobjekte aus LanceDB für alle referenzierten Objekte."""
+    db = lancedb.connect(LANCEDB_PATH)
+    table = db.open_table(LANCEDB_TABLE)
+    context_objs = []
+    for obj_type, obj_name in refs:
+        query_emb = np.zeros(1024, dtype=np.float32).tolist()
+        try:
+            results = table.search(query_emb).limit(top_k).to_list()
+            # Filter auf exakten Namen
+            for obj in results:
+                if obj.get("object_name", "").strip().lower() == obj_name.strip().lower():
+                    context_objs.append(obj)
+        except Exception:
+            continue
+    return context_objs
+
 def main():
     if len(sys.argv) >= 2:
         object_name = sys.argv[1]
@@ -579,6 +624,14 @@ def main():
     # --- RAG: Kontextobjekte aus LanceDB holen ---
     context_objects = retrieve_context(object_type, obj_name, top_k=3)
 
+    # AL-Datei-Inhalt laden
+    with open(filepath, encoding="utf-8") as f:
+        al_content = f.read()
+    # Referenzen extrahieren
+    refs = extract_referenced_objects_from_al(al_content)
+    # Kontext für Referenzen holen (nur BaseApp/KBA, ggf. filtern)
+    ref_contexts = retrieve_context_for_references(refs)
+
     # Namespace-Analyse durchführen (Prompt bauen und Azure OpenAI abfragen)
     prompt = build_rag_prompt(
         obj_name,
@@ -592,7 +645,9 @@ def main():
             "Alternative Namespace Begründung": "",
             "Analyse": ""
         }],
-        context_objects=context_objects
+        al_content=al_content,
+        context_objects=context_objects,
+        ref_contexts=ref_contexts
     )
     
     print("Sende folgende Anfrage an Azure OpenAI...\n")

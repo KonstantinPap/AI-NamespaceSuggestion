@@ -116,10 +116,22 @@ def extract_references_from_al(content: str) -> List[str]:
 def langchain_analyse(object_type: str, object_name: str, al_content: str, context_objects: List[Dict]) -> str:
     """Führe die Analyse mit LangChain und OpenAI durch."""
     allowed_namespaces = [
-        "ApplicationAreas", "System", "Sales", "Purchasing", "Finance", "Inventory", "Warehouse",
-        "Service", "Manufacturing", "Jobs", "CRM", "KBA", "BaseApp", "Reporting", "Integration",
-        "User", "Setup", "DataExchange", "Document", "General", "Logistics", "HR", "Production",
-        "Retail", "Marketing", "Projects", "Administration", "Extensions", "Custom"
+          # Microsoft Standard
+             "Warehouse", 
+             "Utilities", 
+             "System", 
+             "Service", 
+             "Sales", 
+             "RoleCenters", 
+             "Purchases", 
+             "Projects", 
+             "Profile",
+                     "Pricing", "OtherCapabilities", "Manufacturing", "Invoicing", "Inventory", "Integration", "HumanResources",
+    "Foundation", "FixedAssets", "Finance", "eServices", "CRM", "CostAccounting", "CashFlow", "Bank", "Assembly", "API",
+    # KUMAVISION Base (KBA)
+    "UDI", "Call", "LIF", "OrderQuote", "InventorySummary", "Common",
+    # HC/MTC-spezifisch
+    "EDocuments", "ECE", "MDR"
     ]
     prompt = (
         "Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung und die Vergabe von Namespaces.\n"
@@ -202,6 +214,59 @@ def print_namespace_result(result: str):
             console.print(f"- [cyan]{alt.get('namespace','')}[/cyan]: {alt.get('reason','')}")
     console.print("="*60 + "\n")
 
+def agent_analyse_references(obj_dict, references):
+    """Analysiere jede Referenz einzeln mit LLM und sammle die Namespace-Empfehlungen."""
+    ref_contexts = []
+    for ref_name in references:
+        ref_found = find_object_file(obj_dict, ref_name)
+        if not ref_found:
+            continue
+        ref_type, ref_obj_name, ref_info = ref_found
+        al_content = read_file_content(ref_info["filepath"])
+        # Kurzes Prompt für Referenzanalyse
+        prompt = (
+            f"Analysiere das folgende AL-Objekt und gib den Namespace als JSON zurück.\n"
+            f"Objekttyp: {ref_type}\n"
+            f"Objektname: {ref_obj_name}\n"
+            f"AL-Code:\n{al_content}\n"
+            'Gib das Ergebnis als JSON im Format: {"namespace": "..."}'
+        )
+        # Hinweis: invoke statt __call__ verwenden (Deprecation)
+        llm = AzureChatOpenAI(
+            openai_api_key=OPENAI_API_KEY,
+            azure_endpoint=OPENAI_API_BASE,
+            openai_api_version=OPENAI_API_VERSION,
+            deployment_name=OPENAI_DEPLOYMENT,
+            temperature=0.3,
+            max_tokens=200,
+        )
+        messages = [
+            SystemMessage(content="Du bist ein erfahrener AL-Entwickler und Namespace-Experte."),
+            HumanMessage(content=prompt)
+        ]
+        try:
+            response = llm.invoke(messages)
+            import re, json
+            match = re.search(r'\{.*\}', response.content, re.DOTALL)
+            ns = ""
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                    ns = data.get("namespace", "")
+                except Exception:
+                    ns = ""
+            ref_contexts.append({
+                "object_type": ref_type,
+                "object_name": ref_obj_name,
+                "namespace": ns,
+                "directory": ref_info.get("directory"),
+                "filepath": ref_info.get("filepath"),
+            })
+        except Exception as ex:
+            # Fehler ignorieren, Referenz wird nicht als Kontext genutzt
+            continue
+    return ref_contexts
+
 def main():
     print("Starte parallele Indexierung...")
     obj_dict = parallel_scan_al_files(SEARCH_ROOTS)
@@ -219,7 +284,7 @@ def main():
     print(f"Analysiere Objekt: {object_type} {obj_name}")
     result = langchain_analyse(object_type, obj_name, al_content, context_objects=[])
 
-    # 2. Referenzen extrahieren und ggf. Kontextobjekte laden
+    # 2. Referenzen extrahieren
     references = extract_references_from_al(al_content)
     context_objs = []
     for ref_name in references:
@@ -233,9 +298,17 @@ def main():
                 "directory": ref_info.get("directory"),
                 "filepath": ref_info.get("filepath"),
             })
-    # Optional: Mehrere KI-Requests, z.B. mit erweitertem Kontext
+
+    # Agent-Variante: Für jede Referenz eine eigene LLM-Analyse (nur bei vielen oder komplexen Referenzen sinnvoll)
     if context_objs:
-        print(f"Starte Analyse mit {len(context_objs)} Kontextobjekten...")
+        print(f"Starte Agent-Analyse für {len(context_objs)} Referenzen...")
+        agent_ref_contexts = agent_analyse_references(obj_dict, references)
+        # Kombiniere Kontextobjekte aus Index und Agent-Analysen
+        # (Agent-Kontext hat ggf. bessere Namespace-Infos)
+        for agent_ctx in agent_ref_contexts:
+            for ctx in context_objs:
+                if ctx["object_name"].lower() == agent_ctx["object_name"].lower():
+                    ctx["namespace"] = agent_ctx["namespace"]
         result = langchain_analyse(object_type, obj_name, al_content, context_objs)
 
     print_namespace_result(result)
