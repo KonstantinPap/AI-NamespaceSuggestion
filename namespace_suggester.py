@@ -486,6 +486,8 @@ def suggest_namespace_llm(obj_info, ref_infos):
         "Du darfst ausschließlich einen Namespace aus folgender Liste verwenden (keinen anderen):\n"
         "WICHTIG: Gib im Feld \"namespace\" ausschließlich den Kurznamen (z.B. 'EServices', 'EDocuments', 'Finance', 'Inventory', etc.) aus der Liste an – NICHT den vollständigen Namespace-Pfad wie 'Microsoft.EServices.EDocument' oder 'System.Environment.Configuration'!\n"
         "Wenn ein Namespace-Pfad wie 'System.Environment.Configuration' in der Liste steht, darfst du nur einen einzelnen Teil daraus wählen, z.B. entweder 'Environment' oder 'Configuration', aber niemals den gesamten Pfad oder mehrere Teile kombiniert.\n"
+        "Beachte außerdem: Der Suffix 'SI' im Objektnamen steht für 'Single Instance' und der Suffix 'Sub' steht im Normalfall für eine Subscriber-Codeunit. "
+        "Berücksichtige diese Bedeutungen bei deiner Analyse und Empfehlung.\n"
         "Beispiel für den Output:\n"
         '{"namespace": "Environment", "reason": "...", "alternatives": [{"namespace": "Configuration", "reason": "..."}]}'
     )
@@ -515,7 +517,7 @@ def suggest_namespace_llm(obj_info, ref_infos):
         azure_endpoint=OPENAI_API_BASE,
         openai_api_version=OPENAI_API_VERSION,
         deployment_name=OPENAI_DEPLOYMENT,
-        temperature=0.7,
+        temperature=0.5,
         max_tokens=800,
     )
     messages = [
