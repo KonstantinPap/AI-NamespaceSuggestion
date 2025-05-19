@@ -620,17 +620,67 @@ def write_results_to_excel(rows, fieldnames, excel_path):
         ws.column_dimensions[get_column_letter(idx)].width = max(20, len(col) + 2)
     wb.save(excel_path)
 
+def is_obsolete_object(al_code: str) -> bool:
+    """
+    Prüft, ob das gesamte Objekt als obsolete markiert ist.
+    Es werden nur Objekte als obsolete erkannt, wenn das Obsolete-Attribut direkt im Objektkopf steht,
+    nicht wenn nur Felder, Prozeduren oder andere Member obsolete sind.
+    """
+    # Suche nach [Obsolete(...)] direkt in den ersten Zeilen (Objektkopf)
+    # Ignoriere Zeilen mit Feld-/Methodendefinitionen
+    header_lines = "\n".join(al_code.splitlines()[:10])
+    return (
+        re.search(r'^\s*\[.*Obsolete.*\]', header_lines, re.IGNORECASE | re.MULTILINE)
+        or re.search(r'^\s*Obsolete\s*=\s*.*;', header_lines, re.IGNORECASE | re.MULTILINE)
+    ) is not None
+
+def get_context_key(obj_info):
+    """
+    Liefert einen Schlüssel für den Kontext, z.B. für Setup-Tabellen oder Objekte mit gleichem Namensstamm.
+    """
+    # Beispiel: Gruppiere nach object_type + Namensstamm (ohne Suffix wie SI/Sub)
+    name = obj_info["object_name"]
+    # Entferne Suffixe wie SI, Sub
+    name_base = re.sub(r'(SI|Sub)$', '', name, flags=re.IGNORECASE)
+    return (obj_info["object_type"].lower(), name_base.lower())
+
+def get_forced_namespace(obj_info, solution_type):
+    """
+    Gibt einen Namespace zurück, falls durch Namensbestandteile oder Obsolete-Status erzwungen.
+    """
+    name = obj_info["object_name"]
+    al_code = obj_info["al_code"]
+    if is_obsolete_object(al_code):
+        return "Obsolete"
+    if "MDR" in name:
+        return "MDR"
+    if "Cll" in name:
+        return "Call" if solution_type == "HC" else "Service"
+    return None
+
 def main():
     # Index für Referenz-Kontext (alle Roots)
     ref_obj_index = index_al_objects_with_type_and_name(SEARCH_ROOTS)
     # Index für zu analysierende Objekte (nur HC/MTC)
     analyze_obj_index = index_al_objects_with_type_and_name(ANALYZE_ROOTS)
-    grouped = build_hc_mtc_object_map(analyze_obj_index)
+
+    # Alle Objekte einzeln betrachten, HC/MTC explizit unterscheiden
+    all_objs = []
+    for (otype, oname), obj in analyze_obj_index.items():
+        solution_type = None
+        if oname.upper().startswith(HC_PREFIX):
+            solution_type = "HC"
+        elif oname.upper().startswith(MTC_PREFIX):
+            solution_type = "MTC"
+        else:
+            # Default zu HC, falls nicht eindeutig
+            solution_type = "HC"
+        all_objs.append((solution_type, obj))
 
     fieldnames = [
         "ObjectType",
-        "HC ObjectName",
-        "MTC ObjectName",
+        "SolutionType",
+        "ObjectName",
         "Namespace Vorschlag",
         "Namespace Begründung",
         "Alternative Namespace Vorschlag",
@@ -640,30 +690,25 @@ def main():
     ]
 
     already_done = read_existing_csv(CSV_OUTPUT)
-    total = len(grouped)
-    processed_tokens = 0
-    start_time = time.time()
-    avg_tokens_per_obj = 2000
-
     results = []
+    context_map = {}  # context_key -> list of obj_idx in results
 
-    write_header = not os.path.exists(CSV_OUTPUT) or os.stat(CSV_OUTPUT).st_size == 0
-    with open(CSV_OUTPUT, "a", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        for idx, ((otype, name_noprefix), obj_pair) in enumerate(tqdm(grouped.items(), desc="Namespace-Vorschläge", unit="Objekt", total=total), 1):
-            hc_obj = obj_pair.get("hc")
-            mtc_obj = obj_pair.get("mtc")
-            hc_name = hc_obj["object_name"] if hc_obj else ""
-            mtc_name = mtc_obj["object_name"] if mtc_obj else ""
-            key = (otype, hc_name.lower(), mtc_name.lower())
-            if key in already_done:
-                continue
-            # Für die Analyse: bevorzugt HC, sonst MTC
-            obj_info = hc_obj or mtc_obj
-            if not obj_info:
-                continue
+    # 1. Alle Objekte analysieren und Namespace-Vorschlag im Speicher sammeln
+    for idx, (solution_type, obj_info) in enumerate(tqdm(all_objs, desc="Namespace-Vorschläge", unit="Objekt"), 1):
+        otype = obj_info["object_type"]
+        obj_name = obj_info["object_name"]
+        key = (otype, solution_type, obj_name.lower(),)
+        if key in already_done:
+            continue
+
+        # Forced Namespace durch Regeln
+        forced_ns = get_forced_namespace(obj_info, solution_type)
+        ns, reason, alternatives, analyse = None, "", [], ""
+        if forced_ns:
+            ns = forced_ns
+            reason = f"Namespace durch Regel erzwungen: {forced_ns}"
+            analyse = reason
+        else:
             # Referenzen analysieren (mit Typ und Name, Kontext aus ref_obj_index)
             ref_infos = []
             if obj_info["al_code"]:
@@ -672,33 +717,49 @@ def main():
                     if ref_obj:
                         ref_infos.append({"object_type": ref_obj["object_type"], "object_name": ref_obj["object_name"], "namespace": ref_obj["namespace"]})
             ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos)
-            alt_ns = "; ".join([a[0] for a in alternatives])
-            alt_reason = "; ".join([a[1] for a in alternatives])
-            row = {
-                "ObjectType": otype,
-                "HC ObjectName": hc_name,
-                "MTC ObjectName": mtc_name,
-                "Namespace Vorschlag": ns,
-                "Namespace Begründung": reason,
-                "Alternative Namespace Vorschlag": alt_ns,
-                "Alternative Namespace Begründung": alt_reason,
-                "Dateipfad": (hc_obj["filepath"] if hc_obj else "") or (mtc_obj["filepath"] if mtc_obj else ""),
-                "Analyse": analyse.strip().replace(chr(10), ' ')
-            }
-            writer.writerow(row)
-            csvfile.flush()
-            results.append(row)
-            processed_tokens += avg_tokens_per_obj
-            elapsed = time.time() - start_time
-            avg_time = elapsed / idx if idx > 0 else 0
-            remaining = total - idx
-            tokens_per_minute = 100_000
-            expected_time_for_tokens = processed_tokens / tokens_per_minute * 60
-            eta = max((remaining * avg_time), (expected_time_for_tokens - elapsed))
-            print(f"Bearbeitet: {idx}/{total} | Verstrichen: {elapsed:.1f}s | Ø {avg_time:.1f}s/Objekt | ETA: {eta/60:.1f}min", end="\r")
-            time.sleep(0.2)
 
-    # Nach Abschluss: Export nach Excel
+        alt_ns = "; ".join([a[0] for a in alternatives])
+        alt_reason = "; ".join([a[1] for a in alternatives])
+        row = {
+            "ObjectType": otype,
+            "SolutionType": solution_type,
+            "ObjectName": obj_name,
+            "Namespace Vorschlag": ns,
+            "Namespace Begründung": reason,
+            "Alternative Namespace Vorschlag": alt_ns,
+            "Alternative Namespace Begründung": alt_reason,
+            "Dateipfad": obj_info["filepath"],
+            "Analyse": analyse.strip().replace(chr(10), ' ')
+        }
+        results.append(row)
+        # Kontext-Mapping für spätere Konsistenzprüfung
+        ctx_key = get_context_key(obj_info)
+        context_map.setdefault(ctx_key, []).append(len(results) - 1)
+
+    # 2. Nachbearbeitung: Konsistenz im Kontext sicherstellen
+    for ctx_key, idx_list in context_map.items():
+        # Prüfe, ob alle Namespace-Vorschläge im Kontext gleich sind
+        ns_counter = {}
+        for idx in idx_list:
+            ns = results[idx]["Namespace Vorschlag"]
+            if ns:
+                ns_counter[ns] = ns_counter.get(ns, 0) + 1
+        if ns_counter:
+            # Wähle den häufigsten Namespace im Kontext
+            best_ns = max(ns_counter.items(), key=lambda x: x[1])[0]
+            for idx in idx_list:
+                # Nur überschreiben, wenn nicht forced (z.B. Obsolete, MDR, Cll)
+                if not get_forced_namespace({"object_name": results[idx]["ObjectName"], "al_code": ""}, results[idx]["SolutionType"]):
+                    results[idx]["Namespace Vorschlag"] = best_ns
+                    results[idx]["Namespace Begründung"] += f" (Konsistenz im Kontext: {best_ns})"
+
+    # 3. Schreibe Ergebnisse in CSV/Excel
+    write_header = not os.path.exists(CSV_OUTPUT) or os.stat(CSV_OUTPUT).st_size == 0
+    with open(CSV_OUTPUT, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
     excel_path = CSV_OUTPUT.replace(".csv", ".xlsx")
     write_results_to_excel(results, fieldnames, excel_path)
 
