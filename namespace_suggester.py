@@ -473,14 +473,22 @@ def extract_reference_tuples(al_code: str) -> List[Tuple[str, str]]:
             refs.append((m[2].lower(), m[3].replace('"', '').lower()))
     return list(set(refs))
 
+# "Besonders wichtig ist, wenn Objekte auf Einrichtuungen (Setup-Tabellen) verweisen"
+        # TODO Verweise auf MED Einrichtungen
+        # TODO Berückischtige schon bisher gemachte Entscheidungen
+        # TODO MEDTEC genause gewichten wie HC? Falls abweichender Namespace, dann in die Vorschlag, kommasepariert aufnehmen
+        # TODO Cll Objekt Call gilt nur für HC, für die MTC ist das service
+        # TODO BinCode MTC
+        # TODO HC und MTC gesondert behandeln
+
 def suggest_namespace_llm(obj_info, ref_infos):
     prompt = (
         "Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung und die Vergabe von Namespaces.\n"
         "Analysiere das folgende AL-Objekt und schlage einen passenden Namespace vor. "
-        "Beziehe dich dabei auf die Namenskonventionen der Microsoft Base Application. "
+        "Beziehe dich dabei auf die Namenskonventionen der Microsoft Base Application. " 
         "Wenn im Standard (Base Application) für ein Objekt oder dessen Funktionalität bereits ein Namespace wie z.B. 'System', 'Sales', etc. verwendet wird, "
         "sollen die HC- und MTC-Objekte möglichst denselben Namespace verwenden. "
-        "Die Entscheidung für den Namespace soll sich vorrangig an den Objekten der Base Application orientieren.\n"
+        "Die Entscheidung für den Namespace soll sich vorrangig an den Objekten der Base Application orientieren, aber auch die Namespace ECE und MDR sollten mit einkalkuliert werden.\n"        
         "Falls ein anderer Namespace sinnvoller ist, begründe dies nachvollziehbar.\n"
         "Die Begründung (\"reason\") und alle Alternativen im JSON-Output müssen ausschließlich auf DEUTSCH formuliert sein.\n"
         "Du darfst ausschließlich einen Namespace aus folgender Liste verwenden (keinen anderen):\n"
