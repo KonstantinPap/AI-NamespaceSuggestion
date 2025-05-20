@@ -8,15 +8,20 @@ from tqdm import tqdm
 from langchain_community.chat_models import AzureChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage
 
-HC_ROOT = "C:/Repos/DevOps/HC-Work/Product_MED/Product_MED_AL/app/"
-MTC_ROOT = "C:/Repos/DevOps/MTC-Work/Product_MED_Tech365/Product_MED_Tech/app/"
-ANALYZE_ROOTS = [HC_ROOT, MTC_ROOT]
+# HC_ROOT = "C:/Repos/DevOps/HC-Work/Product_MED/Product_MED_AL/app/"
+# MTC_ROOT = "C:/Repos/DevOps/MTC-Work/Product_MED_Tech365/Product_MED_Tech/app/"
+# KBA_ROOT = "C:/Repos/DevOps/KUMAVISION/BC_KBA/app/"
+HC_ROOT = "/home/kosta/Repos/DevOps/Product_MED/Product_MED_AL/app/"
+MTC_ROOT = "/home/kosta/Repos/DevOps/Product_MED_Tech365/Product_MED_Tech/app/"
+KBA_ROOT = "/home/kosta/Repos/DevOps/Product_KBA/Product_KBA_BC_AL/app/"
+ANALYZE_ROOTS = [HC_ROOT, MTC_ROOT, KBA_ROOT]
 
 SEARCH_ROOTS = [
-    HC_ROOT,
+    KBA_ROOT,
     MTC_ROOT,
-    "C:/Repos/Github/StefanMaron/MSDyn365BC.Code.History/BaseApp/Source/Base Application/",
-    "C:/Repos/DevOps/HC-Work/Product_KBA/Product_KBA_BC_AL/app/",
+    HC_ROOT,    
+    #"C:/Repos/Github/StefanMaron/MSDyn365BC.Code.History/BaseApp/Source/Base Application/",    
+    "/home/kosta/Repos/GitHub/StefanMaron/MSDyn365BC.Code.History/BaseApp/Source/Base Application/",    
 ]
 CSV_OUTPUT = "namespace_suggestions.csv"
 # Azure OpenAI Konfiguration
@@ -481,6 +486,24 @@ def extract_reference_tuples(al_code: str) -> List[Tuple[str, str]]:
         # TODO BinCode MTC
         # TODO HC und MTC gesondert behandeln
 
+USE_AZURE_OPENAI = False  # True = Azure OpenAI, False = Ollama lokal
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "gemma3:12b"
+
+def call_ollama(prompt: str) -> str:
+    """Ruft das lokale Ollama Modell auf."""
+    import requests
+    try:
+        response = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt + "\nFormatiere deine Antwort als valides JSON.",
+            "stream": False
+        })
+        return response.json().get('response', '')
+    except Exception as e:
+        return f"Ollama-Fehler: {e}"
+
 def suggest_namespace_llm(obj_info, ref_infos):
     prompt = (
         "Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung und die Vergabe von Namespaces.\n"
@@ -520,35 +543,54 @@ def suggest_namespace_llm(obj_info, ref_infos):
         '{"namespace": "...", "reason": "...", "alternatives": [{"namespace": "...", "reason": "..."}]}'
         "Deine Empfehlung:"
     )
-    llm = AzureChatOpenAI(
-        openai_api_key=OPENAI_API_KEY,
-        azure_endpoint=OPENAI_API_BASE,
-        openai_api_version=OPENAI_API_VERSION,
-        deployment_name=OPENAI_DEPLOYMENT,
-        temperature=0.5,
-        max_tokens=800,
-    )
-    messages = [
-        SystemMessage(content="Du bist ein erfahrener AL-Entwickler und Namespace-Experte."),
-        HumanMessage(content=prompt)
-    ]
-    try:
-        response = llm.invoke(messages)
+
+    if USE_AZURE_OPENAI:
+        llm = AzureChatOpenAI(
+            openai_api_key=OPENAI_API_KEY,
+            azure_endpoint=OPENAI_API_BASE,
+            openai_api_version=OPENAI_API_VERSION,
+            deployment_name=OPENAI_DEPLOYMENT,
+            temperature=0.5,
+            max_tokens=800,
+        )
+        messages = [
+            SystemMessage(content="Du bist ein erfahrener AL-Entwickler und Namespace-Experte."),
+            HumanMessage(content=prompt)
+        ]
+        try:
+            response = llm.invoke(messages)
+            import json as pyjson
+            text = response.content
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                data = pyjson.loads(match.group(0))
+                ns = data.get("namespace", "")
+                reason = data.get("reason", "")
+                alternatives = []
+                for alt in data.get("alternatives", []):
+                    alternatives.append((alt.get("namespace", ""), alt.get("reason", "")))
+                return ns, reason, alternatives, text
+            else:
+                return "", "Konnte kein JSON aus Azure OpenAI-Antwort extrahieren.", [], text
+        except Exception as e:
+            return "", f"Azure OpenAI-Fehler: {e}", [], ""
+    else:
+        text = call_ollama(prompt)
         import json as pyjson
-        text = response.content
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
-            data = pyjson.loads(match.group(0))
-            ns = data.get("namespace", "")
-            reason = data.get("reason", "")
-            alternatives = []
-            for alt in data.get("alternatives", []):
-                alternatives.append((alt.get("namespace", ""), alt.get("reason", "")))
-            return ns, reason, alternatives, text
+            try:
+                data = pyjson.loads(match.group(0))
+                ns = data.get("namespace", "")
+                reason = data.get("reason", "")
+                alternatives = []
+                for alt in data.get("alternatives", []):
+                    alternatives.append((alt.get("namespace", ""), alt.get("reason", "")))
+                return ns, reason, alternatives, text
+            except Exception as e:
+                return "", f"Ollama JSON-Fehler: {e}", [], text
         else:
-            return "", "Konnte kein JSON aus Azure OpenAI-Antwort extrahieren.", [], text
-    except Exception as e:
-        return "", f"Azure OpenAI-Fehler: {e}", [], ""
+            return "", "Konnte kein JSON aus Ollama-Antwort extrahieren.", [], text
 
 HC_PREFIX = "KVSMED"
 MTC_PREFIX = "KVSMTC"
@@ -661,21 +703,8 @@ def get_forced_namespace(obj_info, solution_type):
 def main():
     # Index für Referenz-Kontext (alle Roots)
     ref_obj_index = index_al_objects_with_type_and_name(SEARCH_ROOTS)
-    # Index für zu analysierende Objekte (nur HC/MTC)
+    # Index für zu analysierende Objekte (alle ANALYZE_ROOTS)
     analyze_obj_index = index_al_objects_with_type_and_name(ANALYZE_ROOTS)
-
-    # Alle Objekte einzeln betrachten, HC/MTC explizit unterscheiden
-    all_objs = []
-    for (otype, oname), obj in analyze_obj_index.items():
-        solution_type = None
-        if oname.upper().startswith(HC_PREFIX):
-            solution_type = "HC"
-        elif oname.upper().startswith(MTC_PREFIX):
-            solution_type = "MTC"
-        else:
-            # Default zu HC, falls nicht eindeutig
-            solution_type = "HC"
-        all_objs.append((solution_type, obj))
 
     fieldnames = [
         "ObjectType",
@@ -689,79 +718,95 @@ def main():
         "Analyse"
     ]
 
-    already_done = read_existing_csv(CSV_OUTPUT)
-    results = []
-    context_map = {}  # context_key -> list of obj_idx in results
+    for analyze_root in ANALYZE_ROOTS:
+        # Verzeichnisname für Dateinamen extrahieren
+        dir_name = os.path.basename(os.path.normpath(analyze_root))
+        csv_output = f"namespace_suggestions_{dir_name}.csv"
+        excel_output = f"namespace_suggestions_{dir_name}.xlsx"
 
-    # 1. Alle Objekte analysieren und Namespace-Vorschlag im Speicher sammeln
-    for idx, (solution_type, obj_info) in enumerate(tqdm(all_objs, desc="Namespace-Vorschläge", unit="Objekt"), 1):
-        otype = obj_info["object_type"]
-        obj_name = obj_info["object_name"]
-        key = (otype, solution_type, obj_name.lower(),)
-        if key in already_done:
-            continue
+        # Filtere nur Objekte aus diesem analyze_root
+        objs_in_dir = [
+            ((otype, oname), obj)
+            for (otype, oname), obj in analyze_obj_index.items()
+            if obj["filepath"].startswith(analyze_root)
+        ]
 
-        # Forced Namespace durch Regeln
-        forced_ns = get_forced_namespace(obj_info, solution_type)
-        ns, reason, alternatives, analyse = None, "", [], ""
-        if forced_ns:
-            ns = forced_ns
-            reason = f"Namespace durch Regel erzwungen: {forced_ns}"
-            analyse = reason
-        else:
-            # Referenzen analysieren (mit Typ und Name, Kontext aus ref_obj_index)
-            ref_infos = []
-            if obj_info["al_code"]:
-                for ref_type, ref_name in extract_reference_tuples(obj_info["al_code"]):
-                    ref_obj = ref_obj_index.get((ref_type, ref_name))
-                    if ref_obj:
-                        ref_infos.append({"object_type": ref_obj["object_type"], "object_name": ref_obj["object_name"], "namespace": ref_obj["namespace"]})
-            ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos)
+        # Alle Objekte einzeln betrachten, HC/MTC explizit unterscheiden
+        all_objs = []
+        for (otype, oname), obj in objs_in_dir:
+            solution_type = None
+            if oname.upper().startswith(HC_PREFIX):
+                solution_type = "HC"
+            elif oname.upper().startswith(MTC_PREFIX):
+                solution_type = "MTC"
+            else:
+                solution_type = "HC"
+            all_objs.append((solution_type, obj))
 
-        alt_ns = "; ".join([a[0] for a in alternatives])
-        alt_reason = "; ".join([a[1] for a in alternatives])
-        row = {
-            "ObjectType": otype,
-            "SolutionType": solution_type,
-            "ObjectName": obj_name,
-            "Namespace Vorschlag": ns,
-            "Namespace Begründung": reason,
-            "Alternative Namespace Vorschlag": alt_ns,
-            "Alternative Namespace Begründung": alt_reason,
-            "Dateipfad": obj_info["filepath"],
-            "Analyse": analyse.strip().replace(chr(10), ' ')
-        }
-        results.append(row)
-        # Kontext-Mapping für spätere Konsistenzprüfung
-        ctx_key = get_context_key(obj_info)
-        context_map.setdefault(ctx_key, []).append(len(results) - 1)
+        already_done = read_existing_csv(csv_output)
+        results = []
+        context_map = {}
 
-    # 2. Nachbearbeitung: Konsistenz im Kontext sicherstellen
-    for ctx_key, idx_list in context_map.items():
-        # Prüfe, ob alle Namespace-Vorschläge im Kontext gleich sind
-        ns_counter = {}
-        for idx in idx_list:
-            ns = results[idx]["Namespace Vorschlag"]
-            if ns:
-                ns_counter[ns] = ns_counter.get(ns, 0) + 1
-        if ns_counter:
-            # Wähle den häufigsten Namespace im Kontext
-            best_ns = max(ns_counter.items(), key=lambda x: x[1])[0]
+        for idx, (solution_type, obj_info) in enumerate(tqdm(all_objs, desc=f"Namespace-Vorschläge ({dir_name})", unit="Objekt", total=len(all_objs)), 1):
+            otype = obj_info["object_type"]
+            obj_name = obj_info["object_name"]
+            key = (otype, solution_type, obj_name.lower(),)
+            if key in already_done:
+                continue
+
+            forced_ns = get_forced_namespace(obj_info, solution_type)
+            ns, reason, alternatives, analyse = None, "", [], ""
+            if forced_ns:
+                ns = forced_ns
+                reason = f"Namespace durch Regel erzwungen: {forced_ns}"
+                analyse = reason
+            else:
+                ref_infos = []
+                if obj_info["al_code"]:
+                    for ref_type, ref_name in extract_reference_tuples(obj_info["al_code"]):
+                        ref_obj = ref_obj_index.get((ref_type, ref_name))
+                        if ref_obj:
+                            ref_infos.append({"object_type": ref_obj["object_type"], "object_name": ref_obj["object_name"], "namespace": ref_obj["namespace"]})
+                ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos)
+
+            alt_ns = "; ".join([a[0] for a in alternatives])
+            alt_reason = "; ".join([a[1] for a in alternatives])
+            row = {
+                "ObjectType": otype,
+                "SolutionType": solution_type,
+                "ObjectName": obj_name,
+                "Namespace Vorschlag": ns,
+                "Namespace Begründung": reason,
+                "Alternative Namespace Vorschlag": alt_ns,
+                "Alternative Namespace Begründung": alt_reason,
+                "Dateipfad": obj_info["filepath"],
+                "Analyse": analyse.strip().replace(chr(10), ' ')
+            }
+            results.append(row)
+            ctx_key = get_context_key(obj_info)
+            context_map.setdefault(ctx_key, []).append(len(results) - 1)
+
+        # Nachbearbeitung: Konsistenz im Kontext sicherstellen
+        for ctx_key, idx_list in context_map.items():
+            ns_counter = {}
             for idx in idx_list:
-                # Nur überschreiben, wenn nicht forced (z.B. Obsolete, MDR, Cll)
-                if not get_forced_namespace({"object_name": results[idx]["ObjectName"], "al_code": ""}, results[idx]["SolutionType"]):
-                    results[idx]["Namespace Vorschlag"] = best_ns
-                    results[idx]["Namespace Begründung"] += f" (Konsistenz im Kontext: {best_ns})"
+                ns = results[idx]["Namespace Vorschlag"]
+                if ns:
+                    ns_counter[ns] = ns_counter.get(ns, 0) + 1
+            if ns_counter:
+                best_ns = max(ns_counter.items(), key=lambda x: x[1])[0]
+                for idx in idx_list:
+                    if not get_forced_namespace({"object_name": results[idx]["ObjectName"], "al_code": ""}, results[idx]["SolutionType"]):
+                        results[idx]["Namespace Vorschlag"] = best_ns
+                        results[idx]["Namespace Begründung"] += f" (Konsistenz im Kontext: {best_ns})"
 
-    # 3. Schreibe Ergebnisse in CSV/Excel
-    write_header = not os.path.exists(CSV_OUTPUT) or os.stat(CSV_OUTPUT).st_size == 0
-    with open(CSV_OUTPUT, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in results:
-            writer.writerow(row)
-    excel_path = CSV_OUTPUT.replace(".csv", ".xlsx")
-    write_results_to_excel(results, fieldnames, excel_path)
+        # Schreibe Ergebnisse in CSV/Excel
+        with open(csv_output, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
+        write_results_to_excel(results, fieldnames, excel_output)
 
 if __name__ == "__main__":
     main()
