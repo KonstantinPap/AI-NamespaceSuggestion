@@ -504,14 +504,36 @@ def call_ollama(prompt: str) -> str:
     except Exception as e:
         return f"Ollama-Fehler: {e}"
 
-def suggest_namespace_llm(obj_info, ref_infos):
+def read_namespace_context_from_csv(csv_path: str) -> dict:
+    """
+    Liest bestehende Namespace-Entscheidungen aus einer CSV und gibt ein Mapping
+    (object_type, name_base) -> Namespace zurück.
+    """
+    context = {}
+    if not os.path.exists(csv_path):
+        return context
+    with open(csv_path, newline='', encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            otype = row.get("ObjectType", "").strip().lower()
+            obj_name = row.get("ObjectName", "").strip()
+            # Namensstamm extrahieren (wie in get_context_key)
+            name_base = re.sub(r'(SI|Sub)$', '', obj_name, flags=re.IGNORECASE).lower()
+            ns = row.get("Namespace Vorschlag", "").strip()
+            if otype and name_base and ns:
+                context[(otype, name_base)] = ns
+    return context
+
+NAMESPACE_CONTEXT_CSV = "/home/kosta/Repos/GitHub/KonnosPB/AI-NamespaceSuggestion/namespace_suggestions.csv"
+
+def suggest_namespace_llm(obj_info, ref_infos, context_ns=None):
     prompt = (
         "Du bist ein Experte für Microsoft Dynamics 365 Business Central AL-Entwicklung und die Vergabe von Namespaces.\n"
         "Analysiere das folgende AL-Objekt und schlage einen passenden Namespace vor. "
         "Beziehe dich dabei auf die Namenskonventionen der Microsoft Base Application. " 
         "Wenn im Standard (Base Application) für ein Objekt oder dessen Funktionalität bereits ein Namespace wie z.B. 'System', 'Sales', etc. verwendet wird, "
         "sollen die HC- und MTC-Objekte möglichst denselben Namespace verwenden. "
-        "Die Entscheidung für den Namespace soll sich vorrangig an den Objekten der Base Application orientieren, aber auch die Namespace ECE und MDR sollten mit einkalkuliert werden.\n"        
+        "Die Entscheidung für den Namespace soll sich vorrangig HC/MTC, danach der KUMAVISION base/KBA und wenn das nicht sinnvoll ist, an den Objekten der Base Application.\n"
         "Falls ein anderer Namespace sinnvoller ist, begründe dies nachvollziehbar.\n"
         "Die Begründung (\"reason\") und alle Alternativen im JSON-Output müssen ausschließlich auf DEUTSCH formuliert sein.\n"
         "Du darfst ausschließlich einen Namespace aus folgender Liste verwenden (keinen anderen):\n"
@@ -533,6 +555,15 @@ def suggest_namespace_llm(obj_info, ref_infos):
         prompt += "\nKontext zu referenzierten Objekten:\n"
         for ref in ref_infos:
             prompt += f"- Name: {ref.get('object_name','')}, Namespace: {ref.get('namespace','')}\n"
+    # Kontext-Entscheidung aus früheren Analysen einfügen
+    if context_ns:
+        prompt += (
+            f"\nHinweis: Für Objekte mit dem Namensstamm '{context_ns['name_base']}' wurde in einer älteren Analyse folgender Namespace gewählt: '{context_ns['namespace']}'. "
+            "Diese Entscheidung stammt von einer schwächeren KI und wurde von Experten als nur mittelmäßig bewertet. "
+            "Insbesondere die Gruppierung ähnlicher Objekte sowie die Zuordnung von MDR und Call waren häufig falsch. "
+            "Nutze diese Information nur als Orientierung, aber überbewerte sie nicht. "
+            "Falls du fachlich zu einer besseren Gruppierung oder Korrektur kommst, begründe dies bitte explizit."
+        )
     prompt += (
         "\nDeine Aufgabe:\n"
         "- Analysiere, ob und wie das Objekt oder ähnliche Objekte in der Base Application einem bestimmten Namespace zugeordnet sind.\n"
@@ -543,6 +574,11 @@ def suggest_namespace_llm(obj_info, ref_infos):
         '{"namespace": "...", "reason": "...", "alternatives": [{"namespace": "...", "reason": "..."}]}'
         "Deine Empfehlung:"
     )
+
+    # Kontext-Entscheidung aus früheren Analysen einfügen
+    if context_ns:
+        prompt += f"\nFür Objekte mit dem Namensstamm '{context_ns['name_base']}' wurde bisher folgender Namespace gewählt: '{context_ns['namespace']}'. "
+        prompt += "Bevorzuge diesen Namespace für Konsistenz, sofern fachlich sinnvoll.\n"
 
     if USE_AZURE_OPENAI:
         llm = AzureChatOpenAI(
@@ -718,6 +754,9 @@ def main():
         "Analyse"
     ]
 
+    # Lade Kontext aus vorherigen Analysen
+    context_map = read_namespace_context_from_csv(NAMESPACE_CONTEXT_CSV)
+
     for analyze_root in ANALYZE_ROOTS:
         # Verzeichnisname für Dateinamen extrahieren
         dir_name = os.path.basename(os.path.normpath(analyze_root))
@@ -744,7 +783,7 @@ def main():
             all_objs.append((solution_type, obj))
 
         already_done = read_existing_csv(csv_output)
-        results = []
+        results = {}
         context_map = {}
 
         for idx, (solution_type, obj_info) in enumerate(tqdm(all_objs, desc=f"Namespace-Vorschläge ({dir_name})", unit="Objekt", total=len(all_objs)), 1):
@@ -767,7 +806,12 @@ def main():
                         ref_obj = ref_obj_index.get((ref_type, ref_name))
                         if ref_obj:
                             ref_infos.append({"object_type": ref_obj["object_type"], "object_name": ref_obj["object_name"], "namespace": ref_obj["namespace"]})
-                ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos)
+                # Kontext für das aktuelle Objekt bestimmen
+                ctx_key = get_context_key(obj_info)
+                context_ns = None
+                if ctx_key in context_map:
+                    context_ns = {"name_base": ctx_key[1], "namespace": context_map[ctx_key]}
+                ns, reason, alternatives, analyse = suggest_namespace_llm(obj_info, ref_infos, context_ns)
 
             alt_ns = "; ".join([a[0] for a in alternatives])
             alt_reason = "; ".join([a[1] for a in alternatives])
@@ -782,9 +826,8 @@ def main():
                 "Dateipfad": obj_info["filepath"],
                 "Analyse": analyse.strip().replace(chr(10), ' ')
             }
-            results.append(row)
-            ctx_key = get_context_key(obj_info)
-            context_map.setdefault(ctx_key, []).append(len(results) - 1)
+            results[idx] = row
+            context_map.setdefault(ctx_key, []).append(idx)
 
         # Nachbearbeitung: Konsistenz im Kontext sicherstellen
         for ctx_key, idx_list in context_map.items():
@@ -804,9 +847,9 @@ def main():
         with open(csv_output, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            for row in results:
+            for row in results.values():
                 writer.writerow(row)
-        write_results_to_excel(results, fieldnames, excel_output)
+        write_results_to_excel(list(results.values()), fieldnames, excel_output)
 
 if __name__ == "__main__":
     main()
